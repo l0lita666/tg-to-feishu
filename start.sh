@@ -20,6 +20,7 @@ usage() {
   restart   重启程序
   status    查看运行状态
   groups    列出所有群聊及正确 ID
+  feishu-chats  列出飞书机器人在的群及 chat_id
   foreground 前台运行（调试用，可交互输入验证码）
   install   创建虚拟环境并安装依赖
   login     前台登录（首次使用时运行，输入验证码）
@@ -135,6 +136,7 @@ case "$CMD" in
     restart)    do_restart ;;
     status)     do_status ;;
     groups)     ensure_venv; python list_groups.py ;;
+    feishu-chats) ensure_venv; python list_feishu_chats.py ;;
     -h|--help|help) usage ;;
     *)
         echo "未知命令: $CMD"

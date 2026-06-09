@@ -1,8 +1,13 @@
 .env
+.env.*
+.env*.bak
 .venv/
 __pycache__/
 *.pyc
 *.session
+*.session*
 *.session-journal
 .listener.pid
 logs/
+data/
+telegram_session*.bak

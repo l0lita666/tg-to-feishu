@@ -27,12 +27,17 @@ from telethon.tl.types import (
     Channel,
     Chat,
     DocumentAttributeSticker,
+    MessageEntityMentionName,
     MessageMediaDocument,
     MessageMediaPhoto,
+    TypeMessageEntity,
     User,
 )
 
+from chat_map import invert_chat_map, lookup_feishu_chat, parse_feishu_chat_map
 from feishu_client import FeishuClient, IMAGE_EXTENSIONS
+from feishu_event_server import FeishuEventServer
+from message_mapping import MessageMappingStore, TgMessageRef
 
 logger = logging.getLogger(__name__)
 
@@ -107,10 +112,31 @@ def load_config() -> dict[str, str | int | list[str]]:
     group_chats_raw = os.getenv("GROUP_CHATS", "").strip()
     group_chats = [item.strip() for item in group_chats_raw.split(",") if item.strip()]
     group_mode = os.getenv("GROUP_MODE", "manual").strip().lower()
-    if group_mode not in ("manual", "unmuted"):
-        raise ValueError("GROUP_MODE 仅支持 manual（手动指定群）或 unmuted（所有未静音群）")
+    if group_mode not in ("manual", "unmuted", "manual_unmuted"):
+        raise ValueError(
+            "GROUP_MODE 仅支持 manual（手动指定群）、"
+            "manual_unmuted（列表内且未静音）、unmuted（所有未静音群）"
+        )
     group_refresh_interval = int(os.getenv("GROUP_REFRESH_INTERVAL", "300"))
     incoming_only = os.getenv("INCOMING_ONLY", "true").lower() in ("true", "1", "yes")
+
+    feishu_reply_enabled = os.getenv("FEISHU_REPLY_ENABLED", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+    feishu_chat_map_raw = os.getenv("FEISHU_CHAT_MAP", "").strip()
+    feishu_chat_map = parse_feishu_chat_map(feishu_chat_map_raw)
+    feishu_dm_chat_id = os.getenv("FEISHU_DM_CHAT_ID", "").strip()
+    feishu_event_host = os.getenv("FEISHU_EVENT_HOST", "0.0.0.0").strip()
+    feishu_event_port = int(os.getenv("FEISHU_EVENT_PORT", "8080"))
+    feishu_event_path = os.getenv("FEISHU_EVENT_PATH", "/feishu/event").strip()
+    feishu_verification_token = os.getenv("FEISHU_VERIFICATION_TOKEN", "").strip()
+    feishu_encrypt_key = os.getenv("FEISHU_ENCRYPT_KEY", "").strip()
+    allowed_open_ids_raw = os.getenv("FEISHU_ALLOWED_OPEN_IDS", "").strip()
+    allowed_open_ids = [
+        item.strip() for item in allowed_open_ids_raw.split(",") if item.strip()
+    ]
 
     missing = []
     if not api_id:
@@ -124,6 +150,21 @@ def load_config() -> dict[str, str | int | list[str]]:
 
     if missing:
         raise ValueError(f"缺少必要配置: {', '.join(missing)}，请复制 config.example.env 为 .env 并填写")
+
+    if feishu_reply_enabled:
+        reply_missing = []
+        if not feishu_app_id:
+            reply_missing.append("FEISHU_APP_ID")
+        if not feishu_app_secret:
+            reply_missing.append("FEISHU_APP_SECRET")
+        if not feishu_chat_map and not feishu_dm_chat_id:
+            reply_missing.append("FEISHU_CHAT_MAP 或 FEISHU_DM_CHAT_ID")
+        if not feishu_verification_token:
+            reply_missing.append("FEISHU_VERIFICATION_TOKEN")
+        if reply_missing:
+            raise ValueError(
+                f"启用飞书回复需配置: {', '.join(reply_missing)}"
+            )
 
     return {
         "api_id": int(api_id),
@@ -141,6 +182,15 @@ def load_config() -> dict[str, str | int | list[str]]:
         "group_mode": group_mode,
         "group_refresh_interval": group_refresh_interval,
         "incoming_only": incoming_only,
+        "feishu_reply_enabled": feishu_reply_enabled,
+        "feishu_chat_map": feishu_chat_map,
+        "feishu_dm_chat_id": feishu_dm_chat_id,
+        "feishu_event_host": feishu_event_host,
+        "feishu_event_port": feishu_event_port,
+        "feishu_event_path": feishu_event_path,
+        "feishu_verification_token": feishu_verification_token,
+        "feishu_encrypt_key": feishu_encrypt_key,
+        "feishu_allowed_open_ids": allowed_open_ids,
     }
 
 
@@ -200,6 +250,51 @@ def _user_display_name(user: User) -> str:
     if user.username:
         return f"@{user.username}"
     return str(user.id)
+
+
+def _sender_info_from_user(sender: object | None) -> tuple[int, str, str]:
+    if not isinstance(sender, User):
+        return 0, "", ""
+    username = (sender.username or "").strip()
+    return sender.id, username, _user_display_name(sender)
+
+
+def _text_starts_with_mention(text: str, mention: str) -> bool:
+    stripped = text.lstrip()
+    if not mention:
+        return False
+    return stripped.lower().startswith(mention.lower())
+
+
+def _build_reply_with_mention(
+    reply_text: str,
+    mapping: TgMessageRef,
+) -> tuple[str, list[TypeMessageEntity] | None, int | None]:
+    """根据原 TG 消息映射，生成带 @ 的回复文本与 reply_to。"""
+    reply_to = mapping.tg_msg_id
+
+    if mapping.tg_sender_username:
+        mention = f"@{mapping.tg_sender_username}"
+        if _text_starts_with_mention(reply_text, mention):
+            return reply_text, None, reply_to
+        combined = f"{mention} {reply_text}".strip() if reply_text else mention
+        return combined, None, reply_to
+
+    if mapping.tg_sender_id:
+        mention_text = mapping.tg_sender_name or str(mapping.tg_sender_id)
+        if _text_starts_with_mention(reply_text, mention_text):
+            return reply_text, None, reply_to
+        combined = f"{mention_text} {reply_text}".strip() if reply_text else mention_text
+        entities: list[TypeMessageEntity] = [
+            MessageEntityMentionName(
+                offset=0,
+                length=len(mention_text),
+                user_id=mapping.tg_sender_id,
+            )
+        ]
+        return combined, entities, reply_to
+
+    return reply_text, None, reply_to
 
 
 def _format_msg_time(event: events.NewMessage.Event) -> str:
@@ -435,6 +530,11 @@ class TelegramListener:
             app_secret=config.get("feishu_app_secret", ""),
             api_base=config.get("feishu_api_base", ""),
         )
+        self.tg_to_feishu: dict[int, str] = dict(config.get("feishu_chat_map", {}))
+        self.feishu_to_tg = invert_chat_map(self.tg_to_feishu)
+        self.feishu_dm_chat_id = config.get("feishu_dm_chat_id", "")
+        self.message_store = MessageMappingStore(BASE_DIR / "data" / "message_mappings.db")
+        self.feishu_event_server: FeishuEventServer | None = None
         self.monitored_group_ids: set[int] = set()
         self.monitored_group_usernames: set[str] = set()
         self.chat_titles: dict[int, str] = {}
@@ -442,6 +542,8 @@ class TelegramListener:
         self._running = True
         self._unmuted_group_count = 0
         self._unmuted_primary_titles: dict[int, str] = {}
+        self._avatar_cache: dict[int, str] = {}
+        self._avatar_miss_cache: set[int] = set()
         self._parse_group_chats()
 
     def _parse_group_chats(self) -> None:
@@ -520,6 +622,32 @@ class TelegramListener:
                     ids.add(variant)
         return ids
 
+    def _dialog_matches_config(self, dialog) -> bool:
+        """判断会话是否在 GROUP_CHATS 配置范围内。"""
+        if not self.config["group_chats"]:
+            return False
+
+        chat_id = dialog.id
+        target_ids = self._target_ids_for_config()
+        if chat_id in target_ids:
+            return True
+
+        abs_str = str(abs(chat_id))
+        if str(chat_id).startswith("-100"):
+            if int(f"-{abs_str[3:]}") in target_ids:
+                return True
+        elif int(f"-100{abs_str}") in target_ids:
+            return True
+
+        entity = dialog.entity
+        username = getattr(entity, "username", None)
+        if username:
+            uname = username.lower()
+            for item in self.config["group_chats"]:
+                if item.startswith("@") and item[1:].lower() == uname:
+                    return True
+        return False
+
     async def _scan_unmuted_groups(
         self,
     ) -> tuple[set[int], set[str], dict[int, str], dict[int, str], int, int]:
@@ -546,6 +674,40 @@ class TelegramListener:
 
         return group_ids, usernames, chat_titles, primary_titles, loaded_groups, total_groups
 
+    async def _scan_manual_unmuted_groups(
+        self,
+    ) -> tuple[set[int], set[str], dict[int, str], dict[int, str], int, int]:
+        """扫描 GROUP_CHATS 列表内且未静音的群。"""
+        group_ids: set[int] = set()
+        usernames: set[str] = set()
+        chat_titles: dict[int, str] = {}
+        primary_titles: dict[int, str] = {}
+        configured_count = len(self.config["group_chats"])
+        loaded_groups = 0
+
+        async for dialog in self.client.iter_dialogs():
+            if not dialog.is_group:
+                continue
+            if not self._dialog_matches_config(dialog):
+                continue
+            if _is_peer_muted(dialog.dialog.notify_settings):
+                logger.debug("跳过静音群(在列表中): %s (ID: %s)", dialog.title, dialog.id)
+                continue
+            chat_id = self._collect_entity_ids(
+                dialog.entity, group_ids, usernames, chat_titles
+            )
+            primary_titles[chat_id] = dialog.title or str(chat_id)
+            loaded_groups += 1
+
+        return (
+            group_ids,
+            usernames,
+            chat_titles,
+            primary_titles,
+            loaded_groups,
+            configured_count,
+        )
+
     def _apply_unmuted_groups(
         self,
         group_ids: set[int],
@@ -556,6 +718,7 @@ class TelegramListener:
         total_groups: int,
         *,
         initial: bool = False,
+        filter_mode: str = "unmuted",
     ) -> None:
         """应用未静音群扫描结果，并记录新增/移除。"""
         old_primary = self._unmuted_primary_titles
@@ -577,11 +740,18 @@ class TelegramListener:
         if initial:
             for _, title in sorted(primary_titles.items(), key=lambda item: item[1]):
                 logger.info("已添加监听群聊: %s", title)
-            logger.info(
-                "未静音群模式: 共 %d 个群，监听 %d 个未静音群",
-                total_groups,
-                loaded_groups,
-            )
+            if filter_mode == "manual_unmuted":
+                logger.info(
+                    "手动+未静音模式: 配置 %d 个群，当前监听 %d 个未静音群",
+                    total_groups,
+                    loaded_groups,
+                )
+            else:
+                logger.info(
+                    "未静音群模式: 共 %d 个群，监听 %d 个未静音群",
+                    total_groups,
+                    loaded_groups,
+                )
             interval = self.config.get("group_refresh_interval", 300)
             if interval > 0:
                 logger.info("静音状态将每 %d 秒自动刷新", interval)
@@ -604,12 +774,22 @@ class TelegramListener:
     async def _load_unmuted_groups(self) -> None:
         """首次加载所有未静音的群聊。"""
         result = await self._scan_unmuted_groups()
-        self._apply_unmuted_groups(*result, initial=True)
+        self._apply_unmuted_groups(*result, initial=True, filter_mode="unmuted")
 
     async def _refresh_unmuted_groups(self) -> None:
         """轮询刷新未静音群列表。"""
         result = await self._scan_unmuted_groups()
-        self._apply_unmuted_groups(*result, initial=False)
+        self._apply_unmuted_groups(*result, initial=False, filter_mode="unmuted")
+
+    async def _load_manual_unmuted_groups(self) -> None:
+        """首次加载 GROUP_CHATS 列表内且未静音的群聊。"""
+        result = await self._scan_manual_unmuted_groups()
+        self._apply_unmuted_groups(*result, initial=True, filter_mode="manual_unmuted")
+
+    async def _refresh_manual_unmuted_groups(self) -> None:
+        """轮询刷新列表内未静音群。"""
+        result = await self._scan_manual_unmuted_groups()
+        self._apply_unmuted_groups(*result, initial=False, filter_mode="manual_unmuted")
 
     async def _unmuted_groups_refresh_loop(self) -> None:
         """后台定时刷新未静音群。"""
@@ -619,13 +799,23 @@ class TelegramListener:
             if not self._running:
                 break
             try:
-                await self._refresh_unmuted_groups()
+                if self.config.get("group_mode") == "manual_unmuted":
+                    await self._refresh_manual_unmuted_groups()
+                else:
+                    await self._refresh_unmuted_groups()
             except Exception:
                 logger.exception("刷新未静音群列表失败")
 
     async def _resolve_group_entities(self) -> None:
-        if self.config.get("group_mode") == "unmuted":
+        group_mode = self.config.get("group_mode")
+        if group_mode == "unmuted":
             await self._load_unmuted_groups()
+            return
+        if group_mode == "manual_unmuted":
+            if not self.config["group_chats"]:
+                logger.warning("manual_unmuted 模式需要配置 GROUP_CHATS")
+                return
+            await self._load_manual_unmuted_groups()
             return
 
         if not self.config["group_chats"]:
@@ -709,6 +899,288 @@ class TelegramListener:
 
         return image_keys, media_paths
 
+    async def _get_sender_avatar_key(self, sender: object | None) -> str | None:
+        """下载 TG 用户头像并上传到飞书，返回 img_key（带内存缓存）。"""
+        if not self.feishu.media_enabled or not isinstance(sender, User):
+            return None
+
+        user_id = sender.id
+        if user_id in self._avatar_miss_cache:
+            return None
+        cached = self._avatar_cache.get(user_id)
+        if cached:
+            return cached
+
+        tmp_dir = Path(tempfile.gettempdir()) / "tg-feishu-avatars"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        target = tmp_dir / f"avatar_{user_id}"
+
+        try:
+            result = await self.client.download_profile_photo(sender, file=str(target))
+            if not result:
+                self._avatar_miss_cache.add(user_id)
+                return None
+
+            photo_path = Path(str(result))
+            normalized = _normalize_image_path(photo_path)
+            if not normalized:
+                self._avatar_miss_cache.add(user_id)
+                return None
+
+            image_key = await self.feishu.upload_image(normalized)
+            normalized.unlink(missing_ok=True)
+            if not image_key:
+                return None
+
+            self._avatar_cache[user_id] = image_key
+            logger.debug("TG 头像已缓存 user_id=%s", user_id)
+            return image_key
+        except Exception:
+            logger.exception("下载/上传 TG 头像失败 user_id=%s", user_id)
+            return None
+
+    def _target_feishu_chat(self, tg_chat_id: int) -> str | None:
+        if tg_chat_id > 0:
+            return self.feishu_dm_chat_id or None
+        return lookup_feishu_chat(tg_chat_id, self.tg_to_feishu)
+
+    async def _deliver_to_feishu(
+        self,
+        *,
+        time_str: str,
+        info: str,
+        body: str,
+        image_keys: list[str],
+        tg_chat_id: int,
+        tg_msg_id: int,
+        tg_sender_id: int = 0,
+        tg_sender_username: str = "",
+        tg_sender_name: str = "",
+        avatar_key: str | None = None,
+    ) -> bool:
+        reply_enabled = bool(self.config.get("feishu_reply_enabled"))
+        target_chat_id = self._target_feishu_chat(tg_chat_id)
+
+        if reply_enabled and not target_chat_id:
+            logger.warning("未配置飞书群映射，跳过转发 chat_id=%s", tg_chat_id)
+            return False
+
+        prefer_bot = reply_enabled and bool(target_chat_id)
+        success, feishu_message_id = await self.feishu.send_compact(
+            time_str,
+            info,
+            body,
+            image_keys=image_keys,
+            avatar_key=avatar_key,
+            prefer_bot=prefer_bot,
+            target_chat_id=target_chat_id or "",
+        )
+
+        # 记录飞书卡片映射，供「回复卡片」定位 TG 原消息与发言者
+        if success and feishu_message_id:
+            self.message_store.save(
+                feishu_message_id,
+                tg_chat_id,
+                tg_msg_id,
+                info,
+                tg_sender_id=tg_sender_id,
+                tg_sender_username=tg_sender_username,
+                tg_sender_name=tg_sender_name,
+            )
+            return True
+
+        if prefer_bot and not success:
+            logger.warning("Bot 发送失败，尝试 Webhook 降级 chat_id=%s", tg_chat_id)
+            success, _ = await self.feishu.send_compact(
+                time_str,
+                info,
+                body,
+                image_keys=image_keys,
+                avatar_key=avatar_key,
+                prefer_bot=False,
+            )
+        return success
+
+    async def _download_feishu_images(
+        self,
+        feishu_message_id: str,
+        image_keys: list[str],
+    ) -> list[Path]:
+        image_paths: list[Path] = []
+        if not image_keys or not feishu_message_id:
+            return image_paths
+
+        for image_key in image_keys:
+            image_path = await self.feishu.download_message_image(
+                feishu_message_id,
+                image_key,
+            )
+            if image_path:
+                image_paths.append(image_path)
+        return image_paths
+
+    async def _send_content_to_tg(
+        self,
+        tg_chat_id: int,
+        reply_text: str,
+        image_paths: list[Path],
+        *,
+        reply_to: int | None = None,
+        formatting_entities: list[TypeMessageEntity] | None = None,
+    ) -> None:
+        kwargs: dict = {}
+        if reply_to is not None:
+            kwargs["reply_to"] = reply_to
+        if formatting_entities:
+            kwargs["formatting_entities"] = formatting_entities
+
+        if image_paths:
+            if len(image_paths) == 1:
+                if reply_text:
+                    await self.client.send_file(
+                        tg_chat_id,
+                        image_paths[0],
+                        caption=reply_text,
+                        **kwargs,
+                    )
+                else:
+                    await self.client.send_file(tg_chat_id, image_paths[0], **kwargs)
+            else:
+                await self.client.send_file(
+                    tg_chat_id,
+                    image_paths,
+                    caption=reply_text or None,
+                    **kwargs,
+                )
+        elif reply_text:
+            await self.client.send_message(tg_chat_id, reply_text, **kwargs)
+
+    async def _handle_feishu_message(
+        self,
+        feishu_chat_id: str,
+        reply_text: str,
+        sender_open_id: str,
+        parent_message_id: str | None,
+        feishu_message_id: str,
+        image_keys: list[str],
+    ) -> None:
+        image_paths = await self._download_feishu_images(feishu_message_id, image_keys)
+        if image_keys and not image_paths:
+            await self.feishu.send_bot_text(
+                "❌ 图片下载失败，无法发送到 Telegram，请稍后重试。",
+                feishu_chat_id,
+            )
+            return
+
+        # 群聊：在对应飞书群里直接发消息即可回到 TG 群
+        if feishu_chat_id in self.feishu_to_tg:
+            tg_chat_id = self.feishu_to_tg[feishu_chat_id]
+            final_text = reply_text
+            reply_to: int | None = None
+            formatting_entities: list[TypeMessageEntity] | None = None
+
+            if parent_message_id:
+                mapping = self.message_store.get(parent_message_id)
+                if mapping is None:
+                    logger.info(
+                        "飞书回复未命中映射 parent_id=%s，按普通消息发送",
+                        parent_message_id,
+                    )
+                elif mapping.tg_chat_id != tg_chat_id:
+                    logger.warning(
+                        "飞书回复映射群不匹配 parent_id=%s expected=%s actual=%s",
+                        parent_message_id,
+                        tg_chat_id,
+                        mapping.tg_chat_id,
+                    )
+                else:
+                    final_text, formatting_entities, reply_to = _build_reply_with_mention(
+                        reply_text,
+                        mapping,
+                    )
+                    logger.info(
+                        "飞书回复 TG 卡片：自动 @ 原发言者 sender_id=%s username=%s reply_to=%s",
+                        mapping.tg_sender_id,
+                        mapping.tg_sender_username or "-",
+                        reply_to,
+                    )
+
+            try:
+                await self._send_content_to_tg(
+                    tg_chat_id,
+                    final_text,
+                    image_paths,
+                    reply_to=reply_to,
+                    formatting_entities=formatting_entities,
+                )
+                logger.info(
+                    "飞书群消息已发到 TG 群 chat=%s <- 飞书用户 %s (text=%s images=%d reply_to=%s)",
+                    tg_chat_id,
+                    sender_open_id,
+                    bool(final_text),
+                    len(image_paths),
+                    reply_to,
+                )
+            except Exception:
+                logger.exception("发送到 TG 群失败 chat=%s", tg_chat_id)
+                await self.feishu.send_bot_text(
+                    "❌ 发送到 Telegram 群失败，请稍后重试。",
+                    feishu_chat_id,
+                )
+            finally:
+                for image_path in image_paths:
+                    image_path.unlink(missing_ok=True)
+            return
+
+        # 私聊汇总群：必须回复某人的消息卡片
+        if self.feishu_dm_chat_id and feishu_chat_id == self.feishu_dm_chat_id:
+            if not parent_message_id:
+                await self.feishu.send_bot_text(
+                    "私聊汇总群请使用「回复」功能：点某人的转发消息卡片再发送，才能回到对应 TG 私聊。",
+                    feishu_chat_id,
+                )
+                for image_path in image_paths:
+                    image_path.unlink(missing_ok=True)
+                return
+
+            mapping = self.message_store.get(parent_message_id)
+            if mapping is None:
+                logger.warning("未找到私聊映射 parent_id=%s", parent_message_id)
+                await self.feishu.send_bot_text(
+                    "未能回复：请直接回复机器人转发的那条消息卡片。",
+                    feishu_chat_id,
+                )
+                for image_path in image_paths:
+                    image_path.unlink(missing_ok=True)
+                return
+
+            try:
+                await self._send_content_to_tg(
+                    mapping.tg_chat_id,
+                    reply_text,
+                    image_paths,
+                )
+                logger.info(
+                    "私聊已发到 TG user=%s <- 飞书用户 %s (text=%s images=%d)",
+                    mapping.tg_chat_id,
+                    sender_open_id,
+                    bool(reply_text),
+                    len(image_paths),
+                )
+            except Exception:
+                logger.exception(
+                    "私聊回复 TG 失败 user=%s msg=%s",
+                    mapping.tg_chat_id,
+                    mapping.tg_msg_id,
+                )
+                await self.feishu.send_bot_text(
+                    "❌ 回复 Telegram 私聊失败，请稍后重试。",
+                    feishu_chat_id,
+                )
+            finally:
+                for image_path in image_paths:
+                    image_path.unlink(missing_ok=True)
+
     async def _on_new_message(self, event: events.NewMessage.Event) -> None:
         if event.message.grouped_id:
             logger.debug(
@@ -742,6 +1214,13 @@ class TelegramListener:
         time_str, info, body = await format_message(event, self.client, self.chat_titles)
         logger.info(">>> 转发到 Lark... %s · %s", time_str, info)
 
+        sender = event.sender
+        if sender is None:
+            with contextlib.suppress(Exception):
+                sender = await event.get_sender()
+        tg_sender_id, tg_sender_username, tg_sender_name = _sender_info_from_user(sender)
+        avatar_key = await self._get_sender_avatar_key(sender)
+
         media_paths: list[Path] = []
         image_keys: list[str] = []
         try:
@@ -756,8 +1235,17 @@ class TelegramListener:
                 else:
                     logger.debug("未配置 FEISHU_APP_ID/SECRET，跳过图片转发")
 
-            success = await self.feishu.send_compact(
-                time_str, info, body, image_keys=image_keys
+            success = await self._deliver_to_feishu(
+                time_str=time_str,
+                info=info,
+                body=body,
+                image_keys=image_keys,
+                tg_chat_id=event.chat_id,
+                tg_msg_id=event.message.id,
+                tg_sender_id=tg_sender_id,
+                tg_sender_username=tg_sender_username,
+                tg_sender_name=tg_sender_name,
+                avatar_key=avatar_key,
             )
         finally:
             for media_path in media_paths:
@@ -797,6 +1285,13 @@ class TelegramListener:
         )
         logger.info(">>> 转发相册到 Lark... %s · %s (%d 张)", time_str, info, len(event.messages))
 
+        sender = first.sender
+        if sender is None:
+            with contextlib.suppress(Exception):
+                sender = await first.get_sender()
+        tg_sender_id, tg_sender_username, tg_sender_name = _sender_info_from_user(sender)
+        avatar_key = await self._get_sender_avatar_key(sender)
+
         media_paths: list[Path] = []
         image_keys: list[str] = []
         try:
@@ -810,8 +1305,17 @@ class TelegramListener:
             else:
                 logger.debug("未配置 FEISHU_APP_ID/SECRET，跳过图片转发")
 
-            success = await self.feishu.send_compact(
-                time_str, info, body, image_keys=image_keys
+            success = await self._deliver_to_feishu(
+                time_str=time_str,
+                info=info,
+                body=body,
+                image_keys=image_keys,
+                tg_chat_id=event.chat_id,
+                tg_msg_id=first.id,
+                tg_sender_id=tg_sender_id,
+                tg_sender_username=tg_sender_username,
+                tg_sender_name=tg_sender_name,
+                avatar_key=avatar_key,
             )
         finally:
             for media_path in media_paths:
@@ -823,6 +1327,25 @@ class TelegramListener:
             logger.info("已转发相册 chat_id=%s msg_ids=%s", event.chat_id, msg_ids)
         else:
             logger.error("转发相册失败 chat_id=%s msg_ids=%s", event.chat_id, msg_ids)
+
+    @staticmethod
+    def _is_password_error(exc: RPCError) -> bool:
+        message = str(exc).upper()
+        return "PASSWORD" in message or "PASSWORD_HASH_INVALID" in message
+
+    async def _prompt_two_factor_password(self) -> None:
+        """两步验证：密码错误时允许重试，避免重新请求验证码。"""
+        for attempt in range(1, 6):
+            password = input("请输入两步验证密码: ").strip()
+            try:
+                await self.client.sign_in(password=password)
+                return
+            except RPCError as exc:
+                if self._is_password_error(exc):
+                    logger.error("两步验证密码错误，请重试 (%d/5)", attempt)
+                    continue
+                raise
+        raise RuntimeError("两步验证密码错误次数过多，请稍后重新运行 ./start.sh login")
 
     async def _ensure_login(self) -> None:
         await self.client.connect()
@@ -837,8 +1360,7 @@ class TelegramListener:
         try:
             await self.client.sign_in(self.config["phone"], code)
         except SessionPasswordNeededError:
-            password = input("请输入两步验证密码: ").strip()
-            await self.client.sign_in(password=password)
+            await self._prompt_two_factor_password()
 
         me = await self.client.get_me()
         logger.info("登录成功: %s (ID: %s)", me.first_name, me.id)
@@ -877,21 +1399,56 @@ class TelegramListener:
         group_mode = self.config.get("group_mode", "manual")
         if group_mode == "unmuted":
             group_desc = f"未静音群 {self._unmuted_group_count}"
+        elif group_mode == "manual_unmuted":
+            group_desc = f"列表内未静音 {self._unmuted_group_count}"
         elif self.config["group_chats"]:
             group_desc = str(len(self.monitored_group_ids))
         else:
             group_desc = "未配置"
+        reply_status = "未启用"
+        if self.config.get("feishu_reply_enabled"):
+            mapped = len(self.tg_to_feishu)
+            dm = "有" if self.feishu_dm_chat_id else "无"
+            reply_status = (
+                f"已启用 :{self.config['feishu_event_port']} "
+                f"(群映射 {mapped} 个, 私聊汇总群 {dm})"
+            )
+            for tg_id, feishu_id in self.tg_to_feishu.items():
+                title = self.chat_titles.get(tg_id, str(tg_id))
+                logger.info("飞书群映射: TG %s (%s) -> %s", title, tg_id, feishu_id)
         logger.info(
-            "监听已启动 | 用户: %s | 私聊: 全部 | 群聊: %s | 图片转发: %s | 代理: %s",
+            "监听已启动 | 用户: %s | 私聊: 全部 | 群聊: %s | 图片转发: %s | 代理: %s | 飞书回复: %s",
             me.first_name,
             group_desc,
             media_status,
             proxy_status,
+            reply_status,
         )
+
+        if self.config.get("feishu_reply_enabled"):
+            allowed = set(self.config.get("feishu_allowed_open_ids", []))
+            group_chat_ids = set(self.feishu_to_tg.keys())
+            self.feishu_event_server = FeishuEventServer(
+                self.feishu,
+                group_chat_ids=group_chat_ids,
+                dm_chat_id=self.feishu_dm_chat_id,
+                verification_token=self.config["feishu_verification_token"],
+                encrypt_key=self.config.get("feishu_encrypt_key", ""),
+                allowed_open_ids=allowed,
+                on_message=self._handle_feishu_message,
+                path=self.config.get("feishu_event_path", "/feishu/event"),
+            )
+            await self.feishu_event_server.start(
+                self.config["feishu_event_host"],
+                self.config["feishu_event_port"],
+            )
+            removed = self.message_store.cleanup_old()
+            if removed:
+                logger.info("已清理 %d 条过期消息映射", removed)
 
         refresh_task: asyncio.Task | None = None
         if (
-            group_mode == "unmuted"
+            group_mode in ("unmuted", "manual_unmuted")
             and self.config.get("group_refresh_interval", 300) > 0
         ):
             refresh_task = asyncio.create_task(self._unmuted_groups_refresh_loop())
@@ -899,6 +1456,9 @@ class TelegramListener:
         try:
             await self.client.run_until_disconnected()
         finally:
+            if self.feishu_event_server is not None:
+                await self.feishu_event_server.stop()
+                self.feishu_event_server = None
             if refresh_task:
                 refresh_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -912,7 +1472,18 @@ class TelegramListener:
             except AuthKeyUnregisteredError:
                 logger.error("会话已失效，请删除 session 文件后重新登录")
                 raise
-            except (ConnectionError, OSError, RPCError) as exc:
+            except (RuntimeError, EOFError, KeyboardInterrupt):
+                raise
+            except RPCError as exc:
+                if not await self.client.is_user_authorized():
+                    logger.error("登录失败: %s", exc)
+                    logger.error(
+                        "请删除 session 文件后重新运行 ./start.sh login；"
+                        "若提示 SEND_CODE_UNAVAILABLE 请等待 15~30 分钟再试"
+                    )
+                    raise SystemExit(1) from exc
+                logger.warning("连接断开 (%s)，%s 秒后重连...", exc, interval)
+            except (ConnectionError, OSError) as exc:
                 logger.warning("连接断开 (%s)，%s 秒后重连...", exc, interval)
             except asyncio.CancelledError:
                 logger.info("收到取消信号，正在退出...")
@@ -923,11 +1494,27 @@ class TelegramListener:
                 if self.client.is_connected():
                     await self.client.disconnect()
 
+            if not self._running:
+                break
+
             if self._running:
                 await asyncio.sleep(interval)
 
     def stop(self) -> None:
         self._running = False
+
+    def request_shutdown(self, loop: asyncio.AbstractEventLoop) -> None:
+        """请求优雅退出：标记停止并断开 TG 连接以结束 run_until_disconnected。"""
+        self.stop()
+
+        async def _shutdown() -> None:
+            if self.feishu_event_server is not None:
+                with contextlib.suppress(Exception):
+                    await self.feishu_event_server.stop()
+            if self.client.is_connected():
+                await self.client.disconnect()
+
+        loop.create_task(_shutdown())
 
 
 async def main() -> None:
@@ -937,18 +1524,26 @@ async def main() -> None:
     listener = TelegramListener(config)
 
     loop = asyncio.get_running_loop()
+    shutdown_count = 0
 
     def _signal_handler() -> None:
-        logger.info("收到退出信号")
-        listener.stop()
+        nonlocal shutdown_count
+        shutdown_count += 1
+        if shutdown_count == 1:
+            logger.info("收到退出信号，正在停止...")
+            listener.request_shutdown(loop)
+            return
+        logger.warning("再次收到退出信号，强制退出")
+        raise SystemExit(0)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _signal_handler)
         except NotImplementedError:
-            signal.signal(sig, lambda *_: listener.stop())
+            signal.signal(sig, lambda *_: listener.request_shutdown(loop))
 
     await listener.run_with_reconnect()
+    logger.info("程序已退出")
 
 
 if __name__ == "__main__":

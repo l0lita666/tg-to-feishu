@@ -19,8 +19,12 @@ if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
     exit 1
 fi
 
-if [[ ! -f "$SCRIPT_DIR/telegram_session.session" ]]; then
-    echo "未找到 telegram_session.session，请先在 Mac 或本机完成 ./start.sh login"
+SESSION_NAME="$(grep -E '^SESSION_NAME=' "$SCRIPT_DIR/.env" | head -1 | cut -d= -f2- | tr -d '\r' | xargs)"
+SESSION_NAME="${SESSION_NAME:-telegram_session}"
+SESSION_FILE="$SCRIPT_DIR/${SESSION_NAME}.session"
+
+if [[ ! -f "$SESSION_FILE" ]]; then
+    echo "未找到 ${SESSION_NAME}.session，请先在 Mac 或本机完成 ./start.sh login"
     exit 1
 fi
 

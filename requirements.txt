@@ -2,3 +2,5 @@ telethon==1.39.0
 python-dotenv==1.1.0
 httpx==0.28.1
 PySocks==1.7.1
+aiohttp==3.11.18
+cryptography==44.0.2
