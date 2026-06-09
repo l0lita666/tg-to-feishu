@@ -276,6 +276,55 @@ async def format_message(
     return time_str, info, body
 
 
+async def format_album_message(
+    event: events.Album.Event,
+    client: TelegramClient,
+    chat_titles: dict[int, str],
+) -> tuple[str, str, str]:
+    """格式化相册消息为 (时间, 来源信息, 正文)。"""
+    first = event.messages[0]
+    chat = await event.get_chat()
+    chat_id = event.chat_id
+    is_group = chat_id < 0
+    chat_label = chat_titles.get(chat_id, "")
+
+    if isinstance(chat, User):
+        chat_label = _user_display_name(chat)
+        is_group = False
+    elif isinstance(chat, (Channel, Chat)):
+        chat_label = getattr(chat, "title", None) or chat_label
+        if chat_label:
+            chat_titles[chat_id] = chat_label
+
+    if not chat_label:
+        chat_label = str(chat_id)
+
+    sender = await event.get_sender()
+    if isinstance(sender, User):
+        sender_label = _user_display_name(sender)
+    else:
+        sender_label = str(event.sender_id) if event.sender_id else "未知"
+
+    msg_date = first.date
+    if msg_date.tzinfo is None:
+        msg_date = msg_date.replace(tzinfo=timezone.utc)
+    time_str = msg_date.astimezone().strftime("%m-%d %H:%M:%S")
+
+    if is_group:
+        info = f"{chat_label} · {sender_label}"
+    else:
+        info = sender_label
+
+    text = (event.text or event.raw_text or "").strip()
+    if text:
+        body = text
+    else:
+        count = len(event.messages)
+        body = f"[相册 {count} 张]" if count > 1 else "[图片]"
+
+    return time_str, info, body
+
+
 def _guess_image_suffix(data: bytes) -> str:
     if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
         return ".jpg"
@@ -304,16 +353,16 @@ def _normalize_image_path(file_path: Path) -> Path | None:
 
 async def download_forwardable_image(
     client: TelegramClient,
-    event: events.NewMessage.Event,
+    chat_id: int,
+    msg,
 ) -> Path | None:
     """下载可转发到 Lark 的图片/贴纸，返回临时文件路径。"""
-    msg = event.message
     if not msg.media:
         return None
 
     tmp_dir = Path(tempfile.gettempdir()) / "tg-feishu-media"
     tmp_dir.mkdir(exist_ok=True)
-    base = tmp_dir / f"{event.chat_id}_{msg.id}"
+    base = tmp_dir / f"{chat_id}_{msg.id}"
 
     async def _download(message, suffix: str = "", **kwargs) -> Path | None:
         target = str(base) + suffix
@@ -353,7 +402,7 @@ async def download_forwardable_image(
             await asyncio.sleep(1)
         except FileReferenceExpiredError:
             logger.info("文件引用过期，刷新消息后重试 (%d/3)", attempt + 1)
-            refreshed = await client.get_messages(event.chat_id, ids=msg.id)
+            refreshed = await client.get_messages(chat_id, ids=msg.id)
             if refreshed:
                 msg = refreshed
             await asyncio.sleep(0.5)
@@ -616,18 +665,13 @@ class TelegramListener:
                 if isinstance(dialog.entity, (Channel, Chat)):
                     logger.info("  - %s (ID: %s)", dialog.title, dialog.id)
 
-    def _should_forward(self, event: events.NewMessage.Event) -> bool:
-        chat_id = event.chat_id
-
-        # 私聊：peer id 为正数
+    def _should_forward_chat(self, chat_id: int, chat=None) -> bool:
         if chat_id > 0:
             return True
 
-        # 群聊/频道：优先用 chat_id 匹配（纯文字消息时 event.chat 可能尚未加载为 None）
         if chat_id in self.monitored_group_ids:
             return True
 
-        chat = event.chat
         if isinstance(chat, (Channel, Chat)):
             username = getattr(chat, "username", None)
             if username and username.lower() in self.monitored_group_usernames:
@@ -635,7 +679,46 @@ class TelegramListener:
 
         return False
 
+    def _should_forward(self, event: events.NewMessage.Event) -> bool:
+        return self._should_forward_chat(event.chat_id, event.chat)
+
+    async def _upload_message_images(
+        self,
+        chat_id: int,
+        messages,
+    ) -> tuple[list[str], list[Path]]:
+        """下载并上传消息中的图片，返回 (image_keys, 临时文件路径列表)。"""
+        image_keys: list[str] = []
+        media_paths: list[Path] = []
+        if not self.feishu.media_enabled:
+            return image_keys, media_paths
+
+        for msg in messages:
+            if not msg.media:
+                continue
+            media_path = await download_forwardable_image(self.client, chat_id, msg)
+            if not media_path:
+                logger.warning("Telegram 媒体下载失败: chat=%s msg=%s", chat_id, msg.id)
+                continue
+            media_paths.append(media_path)
+            image_key = await self.feishu.upload_image(media_path)
+            if image_key:
+                image_keys.append(image_key)
+            else:
+                logger.error("Lark 图片上传失败: chat=%s msg=%s", chat_id, msg.id)
+
+        return image_keys, media_paths
+
     async def _on_new_message(self, event: events.NewMessage.Event) -> None:
+        if event.message.grouped_id:
+            logger.debug(
+                "跳过相册分片 chat=%s msg=%s grouped_id=%s",
+                event.chat_id,
+                event.message.id,
+                event.message.grouped_id,
+            )
+            return
+
         text, media_label = _extract_body(event)
         direction = "发出" if event.out else "收到"
 
@@ -659,33 +742,87 @@ class TelegramListener:
         time_str, info, body = await format_message(event, self.client, self.chat_titles)
         logger.info(">>> 转发到 Lark... %s · %s", time_str, info)
 
-        media_path: Path | None = None
-        image_key: str | None = None
+        media_paths: list[Path] = []
+        image_keys: list[str] = []
         try:
             if event.message.media:
                 if self.feishu.media_enabled:
-                    media_path = await download_forwardable_image(self.client, event)
-                    if media_path:
-                        image_key = await self.feishu.upload_image(media_path)
-                        if image_key:
-                            if body.startswith("[") and body.endswith("]"):
-                                body = ""
-                        else:
-                            logger.error("Lark 图片上传失败，仅发送文字")
-                    else:
-                        logger.warning("Telegram 媒体下载失败，仅发送文字提示")
+                    image_keys, media_paths = await self._upload_message_images(
+                        event.chat_id,
+                        [event.message],
+                    )
+                    if image_keys and body.startswith("[") and body.endswith("]"):
+                        body = ""
                 else:
                     logger.debug("未配置 FEISHU_APP_ID/SECRET，跳过图片转发")
 
-            success = await self.feishu.send_compact(time_str, info, body, image_key=image_key)
+            success = await self.feishu.send_compact(
+                time_str, info, body, image_keys=image_keys
+            )
         finally:
-            if media_path and media_path.exists():
-                media_path.unlink(missing_ok=True)
+            for media_path in media_paths:
+                if media_path.exists():
+                    media_path.unlink(missing_ok=True)
 
         if success:
             logger.info("已转发消息 chat_id=%s msg_id=%s", event.chat_id, event.message.id)
         else:
             logger.error("转发失败 chat_id=%s msg_id=%s", event.chat_id, event.message.id)
+
+    async def _on_album(self, event: events.Album.Event) -> None:
+        first = event.messages[0]
+        direction = "发出" if first.out else "收到"
+        caption = (event.text or event.raw_text or "").strip()
+
+        logger.info(
+            "TG相册 [%s] chat=%s grouped_id=%s 共%d张 | 文字=%r",
+            direction,
+            event.chat_id,
+            event.grouped_id,
+            len(event.messages),
+            caption[:80] if caption else "",
+        )
+
+        if first.out and self.config.get("incoming_only", True):
+            logger.info("跳过：自己发出的相册（如需转发请设 INCOMING_ONLY=false）")
+            return
+
+        chat = await event.get_chat()
+        if not self._should_forward_chat(event.chat_id, chat):
+            logger.info("跳过：不在监听范围 chat_id=%s", event.chat_id)
+            return
+
+        time_str, info, body = await format_album_message(
+            event, self.client, self.chat_titles
+        )
+        logger.info(">>> 转发相册到 Lark... %s · %s (%d 张)", time_str, info, len(event.messages))
+
+        media_paths: list[Path] = []
+        image_keys: list[str] = []
+        try:
+            if self.feishu.media_enabled:
+                image_keys, media_paths = await self._upload_message_images(
+                    event.chat_id,
+                    event.messages,
+                )
+                if image_keys and body.startswith("[") and body.endswith("]"):
+                    body = ""
+            else:
+                logger.debug("未配置 FEISHU_APP_ID/SECRET，跳过图片转发")
+
+            success = await self.feishu.send_compact(
+                time_str, info, body, image_keys=image_keys
+            )
+        finally:
+            for media_path in media_paths:
+                if media_path.exists():
+                    media_path.unlink(missing_ok=True)
+
+        msg_ids = ",".join(str(m.id) for m in event.messages)
+        if success:
+            logger.info("已转发相册 chat_id=%s msg_ids=%s", event.chat_id, msg_ids)
+        else:
+            logger.error("转发相册失败 chat_id=%s msg_ids=%s", event.chat_id, msg_ids)
 
     async def _ensure_login(self) -> None:
         await self.client.connect()
@@ -716,6 +853,13 @@ class TelegramListener:
                 await self._on_new_message(event)
             except Exception:
                 logger.exception("处理消息时出错")
+
+        @self.client.on(events.Album())
+        async def album_handler(event: events.Album.Event) -> None:
+            try:
+                await self._on_album(event)
+            except Exception:
+                logger.exception("处理相册时出错")
 
         self._handlers_registered = True
         incoming_only = self.config.get("incoming_only", True)

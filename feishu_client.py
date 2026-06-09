@@ -108,10 +108,15 @@ class FeishuClient:
         info: str,
         body: str,
         image_key: str | None = None,
+        image_keys: list[str] | None = None,
     ) -> bool:
-        """发送紧凑卡片：灰色小字 meta + 可选图片 + 正文。"""
+        """发送紧凑卡片：灰色小字 meta + 可选图片（支持多张）+ 正文。"""
         if len(body) > MAX_TEXT_LEN:
             body = body[: MAX_TEXT_LEN - 3] + "..."
+
+        keys = list(image_keys or [])
+        if image_key and image_key not in keys:
+            keys.insert(0, image_key)
 
         meta_line = f"{time_str} · {info}" if info else time_str
         elements: list[dict[str, Any]] = [
@@ -124,12 +129,13 @@ class FeishuClient:
             },
         ]
 
-        if image_key:
+        for idx, key in enumerate(keys, start=1):
+            alt = "图片" if len(keys) == 1 else f"图片 {idx}/{len(keys)}"
             elements.append(
                 {
                     "tag": "img",
-                    "img_key": image_key,
-                    "alt": {"tag": "plain_text", "content": "图片"},
+                    "img_key": key,
+                    "alt": {"tag": "plain_text", "content": alt},
                 }
             )
 
@@ -151,15 +157,17 @@ class FeishuClient:
         if await self._post(payload):
             return True
 
-        # 卡片失败时降级：先发文字，再尝试单独发图
-        if image_key and await self.send_image(image_key):
-            return await self.send_text("", meta_line + (f"\n{body}" if body else ""))
+        # 卡片失败时降级：先发文字，再逐张发图
+        text_ok = await self.send_text("", meta_line + (f"\n{body}" if body else ""))
+        images_ok = all(await self.send_image(key) for key in keys) if keys else True
+        if text_ok and images_ok:
+            return True
 
         fallback = meta_line
         if body:
             fallback = f"{fallback}\n{body}"
-        if image_key:
-            fallback = f"{fallback}\n[含图片，卡片发送失败]"
+        if keys:
+            fallback = f"{fallback}\n[含 {len(keys)} 张图片，卡片发送失败]"
         return await self.send_text("", fallback)
 
     async def send_image(self, image_key: str) -> bool:
