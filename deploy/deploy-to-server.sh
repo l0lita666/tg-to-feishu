@@ -1,7 +1,7 @@
 #!/bin/bash
 # 一键部署到新加坡轻量机（bot.99ka.life）
-# 用法: SSHPASS='你的密码' ./deploy/deploy-to-server.sh
-# 或:   ./deploy/deploy-to-server.sh   # 会提示输入密码
+# 用法: SSHPASS='Yzlh@123' ./deploy/deploy-to-server.sh
+# 或:   ./deploy/deploy-to-server.sh   # 会提示输入密码（见 部署与运维手册.md）
 
 set -euo pipefail
 
@@ -31,6 +31,7 @@ echo ">>> [1/6] 测试 SSH..."
 
 echo ">>> [2/6] 上传代码..."
 "${SSH_CMD[@]}" "sudo mkdir -p $DIR && sudo chown \$USER:\$USER $DIR"
+"${SSH_CMD[@]}" "sudo systemctl stop telegram-feishu 2>/dev/null || true"
 rsync -avz -e "$RSYNC_SSH" \
     --exclude '.venv' --exclude 'logs' --exclude '.git' \
     "$PROJECT_DIR/" "${SERVER_USER}@${SERVER_IP}:${DIR}/"
@@ -38,6 +39,7 @@ sshpass -e scp "${SSH_OPTS[@]}" \
     "$PROJECT_DIR/.env" \
     "$PROJECT_DIR/telegram_session.session" \
     "${SERVER_USER}@${SERVER_IP}:${DIR}/"
+"${SSH_CMD[@]}" "chmod u+rw ${DIR}/telegram_session.session ${DIR}/data 2>/dev/null; chmod -R u+rw ${DIR}/data 2>/dev/null || true"
 
 echo ">>> [3/6] 安装 Python 依赖..."
 "${SSH_CMD[@]}" "cd $DIR && ./start.sh install"

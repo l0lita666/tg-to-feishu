@@ -23,6 +23,11 @@ FeishuMessageHandler = Callable[
     Awaitable[None],
 ]
 
+FeishuMessageReadHandler = Callable[
+    [list[str], str, float],
+    Awaitable[None],
+]
+
 # 飞书回复时自带的内部 @ 占位符（如 @_user_1），不是 TG 用户名
 _FEISHU_AT_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
 
@@ -82,6 +87,7 @@ class FeishuEventServer:
         encrypt_key: str = "",
         allowed_open_ids: set[str] | None = None,
         on_message: FeishuMessageHandler | None = None,
+        on_message_read: FeishuMessageReadHandler | None = None,
         path: str = "/feishu/event",
     ) -> None:
         self.feishu = feishu
@@ -91,6 +97,7 @@ class FeishuEventServer:
         self.encrypt_key = encrypt_key.strip()
         self.allowed_open_ids = allowed_open_ids or set()
         self.on_message = on_message
+        self.on_message_read = on_message_read
         self.path = path if path.startswith("/") else f"/{path}"
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -145,12 +152,57 @@ class FeishuEventServer:
             return web.json_response({"msg": "invalid token"}, status=403)
 
         event_type = header.get("event_type", "")
+        if event_type == "card.action.trigger":
+            return web.json_response({})
+
+        if event_type == "im.message.message_read_v1" and self.on_message_read:
+            logger.info("收到飞书消息已读事件")
+            asyncio.create_task(
+                self._process_message_read_safe(payload.get("event", {}))
+            )
+
         if event_type == "im.message.receive_v1" and self.on_message:
             asyncio.create_task(
                 self._process_message_event_safe(payload.get("event", {}))
             )
 
         return web.json_response({})
+
+    async def _process_message_read_safe(self, event: dict[str, Any]) -> None:
+        if not self.on_message_read:
+            return
+        try:
+            await self._handle_message_read_event(event)
+        except Exception:
+            logger.exception("处理飞书消息已读事件失败")
+
+    async def _handle_message_read_event(self, event: dict[str, Any]) -> None:
+        reader = event.get("reader") or {}
+        reader_id = reader.get("reader_id") or {}
+        reader_open_id = str(reader_id.get("open_id", "")).strip()
+        if self.allowed_open_ids and reader_open_id not in self.allowed_open_ids:
+            logger.debug("跳过：飞书已读用户不在白名单 open_id=%s", reader_open_id)
+            return
+
+        try:
+            read_ts = int(reader.get("read_time", 0)) / 1000.0
+        except (TypeError, ValueError):
+            read_ts = 0.0
+
+        message_ids = [
+            str(item).strip()
+            for item in (event.get("message_id_list") or [])
+            if str(item).strip()
+        ]
+        if not message_ids:
+            return
+
+        logger.info(
+            "飞书消息已读 reader=%s count=%d",
+            reader_open_id,
+            len(message_ids),
+        )
+        await self.on_message_read(message_ids, reader_open_id, read_ts)
 
     async def _process_message_event_safe(self, event: dict[str, Any]) -> None:
         try:
@@ -185,11 +237,10 @@ class FeishuEventServer:
             return
 
         logger.info(
-            "飞书消息 -> TG chat=%s parent=%s sender=%s text=%r images=%d",
+            "飞书消息 -> TG feishu_chat=%s feishu_msg=%s parent=%s images=%d",
             feishu_chat_id,
-            parent_id,
-            sender_open_id,
-            reply_text[:80],
+            message_id,
+            parent_id or "-",
             len(image_keys),
         )
         await self.on_message(
