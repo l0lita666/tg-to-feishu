@@ -11,6 +11,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 
 _log_verbose = False
+_read_debug = False
 
 
 def is_log_verbose() -> bool:
@@ -20,6 +21,47 @@ def is_log_verbose() -> bool:
 def set_log_verbose(enabled: bool) -> None:
     global _log_verbose
     _log_verbose = enabled
+
+
+def is_read_debug() -> bool:
+    return _read_debug
+
+
+def set_read_debug(enabled: bool) -> None:
+    global _read_debug
+    _read_debug = enabled
+
+
+def read_log(logger: logging.Logger, msg: str, *args, **kwargs) -> None:
+    """已读同步关键日志：READ_DEBUG 时 WARNING（严格模式可见），否则 INFO。"""
+    trace_log(logger, "已读", msg, *args, **kwargs)
+
+
+def read_skip(logger: logging.Logger, msg: str, *args, **kwargs) -> None:
+    """已读同步跳过原因：仅 READ_DEBUG 时输出 WARNING。"""
+    trace_skip(logger, "已读", msg, *args, **kwargs)
+
+
+def forward_log(logger: logging.Logger, msg: str, *args, **kwargs) -> None:
+    """转发关键日志：READ_DEBUG 时 WARNING，否则 INFO。"""
+    trace_log(logger, "转发", msg, *args, **kwargs)
+
+
+def forward_skip(logger: logging.Logger, msg: str, *args, **kwargs) -> None:
+    """转发跳过原因：仅 READ_DEBUG 时输出 WARNING。"""
+    trace_skip(logger, "转发", msg, *args, **kwargs)
+
+
+def trace_log(logger: logging.Logger, tag: str, msg: str, *args, **kwargs) -> None:
+    if _read_debug:
+        logger.warning(f"[{tag}] " + msg, *args, **kwargs)
+    else:
+        logger.info(msg, *args, **kwargs)
+
+
+def trace_skip(logger: logging.Logger, tag: str, msg: str, *args, **kwargs) -> None:
+    if _read_debug:
+        logger.warning(f"[{tag}·跳过] " + msg, *args, **kwargs)
 
 
 def setup_logging(

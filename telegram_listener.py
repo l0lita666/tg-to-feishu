@@ -42,7 +42,7 @@ from chat_map import invert_chat_map, lookup_feishu_chat, parse_feishu_chat_map
 from feishu_client import FeishuClient, IMAGE_EXTENSIONS
 from feishu_event_server import FeishuEventServer
 from message_mapping import CardSnapshot, MessageMappingStore, TgMessageRef, tg_chat_id_variants
-from log_config import is_log_verbose
+from log_config import forward_log, forward_skip, is_log_verbose, read_log, read_skip
 from read_status import (
     ReadParticipant,
     ReadStatus,
@@ -153,9 +153,39 @@ def load_config() -> dict[str, str | int | list[str]]:
         "1",
         "yes",
     )
+    read_sync_dm_on_view = os.getenv("READ_SYNC_DM_ON_VIEW", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+    read_sync_card_buttons = os.getenv("READ_SYNC_CARD_BUTTONS", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+    read_poll_enabled = os.getenv("READ_POLL_ENABLED", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+    read_watch_enabled = os.getenv("READ_WATCH_ENABLED", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
     read_poll_interval = int(os.getenv("READ_POLL_INTERVAL", "15"))
     read_watch_interval = int(os.getenv("READ_WATCH_INTERVAL", "5"))
+    read_poll_batch_size = int(os.getenv("READ_POLL_BATCH_SIZE", "8"))
+    read_poll_outgoing_batch = int(os.getenv("READ_POLL_OUTGOING_BATCH", "5"))
+    read_poll_startup_delay = int(os.getenv("READ_POLL_STARTUP_DELAY", "30"))
+    feishu_api_min_interval = float(os.getenv("FEISHU_API_MIN_INTERVAL", "1.0"))
+    feishu_avatar_enabled = os.getenv("FEISHU_AVATAR_ENABLED", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
     log_verbose = os.getenv("LOG_VERBOSE", "false").lower() in ("true", "1", "yes")
+    read_debug = os.getenv("READ_DEBUG", "true").lower() in ("true", "1", "yes")
     log_retention_days = int(os.getenv("LOG_RETENTION_DAYS", "3"))
     log_max_mb = int(os.getenv("LOG_MAX_MB", "5"))
     log_cleanup_interval = int(os.getenv("LOG_CLEANUP_INTERVAL_HOURS", "24"))
@@ -228,11 +258,21 @@ def load_config() -> dict[str, str | int | list[str]]:
         "feishu_encrypt_key": feishu_encrypt_key,
         "feishu_allowed_open_ids": allowed_open_ids,
         "read_sync_enabled": read_sync_enabled,
+        "read_sync_dm_on_view": read_sync_dm_on_view,
+        "read_sync_card_buttons": read_sync_card_buttons,
+        "read_poll_enabled": read_poll_enabled,
+        "read_watch_enabled": read_watch_enabled,
         "read_poll_interval": read_poll_interval,
         "read_watch_interval": read_watch_interval,
+        "read_poll_batch_size": read_poll_batch_size,
+        "read_poll_outgoing_batch": read_poll_outgoing_batch,
+        "read_poll_startup_delay": read_poll_startup_delay,
+        "feishu_api_min_interval": feishu_api_min_interval,
+        "feishu_avatar_enabled": feishu_avatar_enabled,
         "feishu_recall_user_reply": feishu_recall_user_reply,
         "feishu_hide_outgoing_echo": feishu_hide_outgoing_echo,
         "log_verbose": log_verbose,
+        "read_debug": read_debug,
         "log_retention_days": log_retention_days,
         "log_max_mb": log_max_mb,
         "log_cleanup_interval": log_cleanup_interval,
@@ -240,9 +280,10 @@ def load_config() -> dict[str, str | int | list[str]]:
 
 
 def setup_logging_from_config(config: dict) -> None:
-    from log_config import set_log_verbose, setup_logging
+    from log_config import set_log_verbose, set_read_debug, setup_logging
 
     set_log_verbose(bool(config.get("log_verbose")))
+    set_read_debug(bool(config.get("read_debug")))
     setup_logging(
         config.get("log_level", "WARNING"),
         max_mb=int(config.get("log_max_mb", 5)),
@@ -569,6 +610,7 @@ class TelegramListener:
             app_id=config.get("feishu_app_id", ""),
             app_secret=config.get("feishu_app_secret", ""),
             api_base=config.get("feishu_api_base", ""),
+            api_min_interval=float(config.get("feishu_api_min_interval", 0.25)),
         )
         self.tg_to_feishu: dict[int, str] = dict(config.get("feishu_chat_map", {}))
         self.feishu_to_tg = invert_chat_map(self.tg_to_feishu)
@@ -924,6 +966,9 @@ class TelegramListener:
         media_paths: list[Path] = []
         if not self.feishu.media_enabled:
             return image_keys, media_paths
+        if self.feishu.api_rate_limited:
+            logger.warning("飞书 API 限流中，跳过消息图片上传 chat=%s", chat_id)
+            return image_keys, media_paths
 
         for msg in messages:
             if not msg.media:
@@ -943,7 +988,11 @@ class TelegramListener:
 
     async def _get_sender_avatar_key(self, sender: object | None) -> str | None:
         """下载 TG 用户头像并上传到飞书，返回 img_key（带内存缓存）。"""
+        if not self.config.get("feishu_avatar_enabled"):
+            return None
         if not self.feishu.media_enabled or not isinstance(sender, User):
+            return None
+        if self.feishu.api_rate_limited:
             return None
 
         user_id = sender.id
@@ -969,9 +1018,11 @@ class TelegramListener:
                 self._avatar_miss_cache.add(user_id)
                 return None
 
-            image_key = await self.feishu.upload_image(normalized)
+            image_key = await self.feishu.upload_image(normalized, optional=True)
             normalized.unlink(missing_ok=True)
             if not image_key:
+                if self.feishu.api_rate_limited:
+                    self._avatar_miss_cache.add(user_id)
                 return None
 
             self._avatar_cache[user_id] = image_key
@@ -1007,6 +1058,8 @@ class TelegramListener:
         is_group = tg_chat_id < 0
         read_status = ReadStatus() if is_outgoing and read_sync_enabled else None
         updatable = read_sync_enabled and reply_enabled
+        if self.feishu.api_rate_limited:
+            avatar_key = None
 
         existing = self.message_store.get_card_by_tg(tg_chat_id, tg_msg_id)
         if existing:
@@ -1028,6 +1081,11 @@ class TelegramListener:
             return False
 
         prefer_bot = reply_enabled and bool(target_chat_id)
+        show_read_buttons = bool(
+            read_sync_enabled
+            and self.config.get("read_sync_card_buttons")
+            and not is_outgoing
+        )
         success, feishu_message_id = await self.feishu.send_compact(
             time_str,
             info,
@@ -1040,6 +1098,7 @@ class TelegramListener:
             is_group=is_group,
             read_status=read_status,
             updatable=updatable,
+            show_read_buttons=show_read_buttons,
         )
 
         if success and feishu_message_id:
@@ -1071,22 +1130,122 @@ class TelegramListener:
                     self._start_outgoing_read_watch(feishu_message_id)
                 else:
                     self._start_incoming_read_watch(feishu_message_id)
+            forward_log(
+                logger,
+                "已发送到飞书 chat=%s tg_msg=%s feishu_msg=%s outgoing=%s",
+                tg_chat_id,
+                tg_msg_id,
+                feishu_message_id,
+                is_outgoing,
+            )
             return True
 
         if prefer_bot and not success:
-            logger.warning("Bot 发送失败，尝试 Webhook 降级 chat_id=%s", tg_chat_id)
-            success, _ = await self.feishu.send_compact(
-                time_str,
-                info,
-                body,
-                image_keys=image_keys,
-                avatar_key=avatar_key,
-                prefer_bot=False,
-            )
+            if self.config.get("feishu_reply_enabled"):
+                logger.error(
+                    "Bot 发送失败 chat_id=%s msg=%s（Bot 模式不降级 Webhook；"
+                    "若持续限流请稍后重试或调大 FEISHU_API_MIN_INTERVAL）",
+                    tg_chat_id,
+                    tg_msg_id,
+                )
+            else:
+                logger.warning("Bot 发送失败，尝试 Webhook 降级 chat_id=%s", tg_chat_id)
+                success, _ = await self.feishu.send_compact(
+                    time_str,
+                    info,
+                    body,
+                    image_keys=image_keys,
+                    avatar_key=avatar_key,
+                    prefer_bot=False,
+                )
         return success
+
+    async def _retry_deliver(
+        self,
+        *,
+        attempt: int = 0,
+        time_str: str,
+        info: str,
+        body: str,
+        image_keys: list[str],
+        tg_chat_id: int,
+        tg_msg_id: int,
+        tg_sender_id: int = 0,
+        tg_sender_username: str = "",
+        tg_sender_name: str = "",
+        avatar_key: str | None = None,
+        is_outgoing: bool = False,
+    ) -> None:
+        max_attempts = 8
+        if attempt >= max_attempts or not self._running:
+            logger.error("转发重试耗尽 chat=%s msg=%s", tg_chat_id, tg_msg_id)
+            return
+
+        for _ in range(24):
+            if not self._running:
+                return
+            if not self.feishu.api_rate_limited:
+                break
+            await asyncio.sleep(5)
+        else:
+            logger.warning(
+                "限流等待超时，继续重试 chat=%s msg=%s attempt=%d",
+                tg_chat_id,
+                tg_msg_id,
+                attempt + 1,
+            )
+
+        await asyncio.sleep(max(float(self.config.get("feishu_api_min_interval", 1.0)), 1.0))
+        success = await self._deliver_to_feishu(
+            time_str=time_str,
+            info=info,
+            body=body,
+            image_keys=image_keys,
+            tg_chat_id=tg_chat_id,
+            tg_msg_id=tg_msg_id,
+            tg_sender_id=tg_sender_id,
+            tg_sender_username=tg_sender_username,
+            tg_sender_name=tg_sender_name,
+            avatar_key=avatar_key,
+            is_outgoing=is_outgoing,
+        )
+        if success:
+            logger.info("限流恢复后转发成功 chat=%s msg=%s", tg_chat_id, tg_msg_id)
+            return
+        if self.feishu.api_rate_limited and self._running:
+            logger.warning(
+                "转发仍被限流，60s 后重试 chat=%s msg=%s attempt=%d",
+                tg_chat_id,
+                tg_msg_id,
+                attempt + 1,
+            )
+            await asyncio.sleep(60)
+            await self._retry_deliver(
+                attempt=attempt + 1,
+                time_str=time_str,
+                info=info,
+                body=body,
+                image_keys=image_keys,
+                tg_chat_id=tg_chat_id,
+                tg_msg_id=tg_msg_id,
+                tg_sender_id=tg_sender_id,
+                tg_sender_username=tg_sender_username,
+                tg_sender_name=tg_sender_name,
+                avatar_key=avatar_key,
+                is_outgoing=is_outgoing,
+            )
+            return
+        logger.error("转发失败 chat=%s msg=%s", tg_chat_id, tg_msg_id)
 
     def _card_from_snapshot(self, snapshot: CardSnapshot) -> dict:
         read_status = ReadStatus.from_json(snapshot.read_status_json)
+        read_sync = bool(self.config.get("read_sync_enabled"))
+        use_buttons = bool(
+            read_sync
+            and self.config.get("read_sync_card_buttons")
+            and not snapshot.is_outgoing
+            and not snapshot.tg_read_synced
+        )
         return self.feishu.build_compact_card(
             snapshot.time_str,
             snapshot.info,
@@ -1097,11 +1256,12 @@ class TelegramListener:
             is_group=snapshot.is_group,
             read_status=read_status if snapshot.is_outgoing else None,
             updatable=True,
+            show_read_buttons=use_buttons,
         )
 
-    async def _patch_card_snapshot(self, snapshot: CardSnapshot) -> None:
+    async def _patch_card_snapshot(self, snapshot: CardSnapshot) -> bool:
         card = self._card_from_snapshot(snapshot)
-        await self.feishu.patch_message_card(snapshot.feishu_message_id, card)
+        return await self.feishu.patch_message_card(snapshot.feishu_message_id, card)
 
     async def _fetch_private_read_status(
         self,
@@ -1153,8 +1313,9 @@ class TelegramListener:
                 token in str(exc)
                 for token in ("CHAT_TOO_BIG", "MSG_TOO_OLD", "MSG_ID_INVALID")
             ):
-                logger.debug(
-                    "小群已读不可用 chat=%s msg=%s err=%s",
+                read_skip(
+                    logger,
+                    "群已读 API 不可用 chat=%s msg=%s err=%s",
                     snapshot.tg_chat_id,
                     snapshot.tg_msg_id,
                     exc,
@@ -1178,6 +1339,8 @@ class TelegramListener:
         if not participants:
             return ReadStatus(is_read=False)
 
+        previous = ReadStatus.from_json(snapshot.read_status_json)
+        prev_by_id = {item.user_id: item for item in previous.readers if item.user_id}
         readers: list[ReadParticipant] = []
         for item in participants:
             user_id = getattr(item, "user_id", 0) or 0
@@ -1186,11 +1349,15 @@ class TelegramListener:
                 read_ts = item.date.timestamp()
             name = ""
             avatar_key = ""
-            if user_id:
+            prev_reader = prev_by_id.get(user_id)
+            if prev_reader:
+                name = prev_reader.name
+                avatar_key = prev_reader.avatar_key
+            if user_id and not avatar_key and not self.feishu.api_rate_limited:
                 with contextlib.suppress(Exception):
                     user = await self.client.get_entity(user_id)
                     if isinstance(user, User):
-                        name = _user_display_name(user)
+                        name = name or _user_display_name(user)
                         avatar_key = await self._get_sender_avatar_key(user) or ""
             readers.append(
                 ReadParticipant(
@@ -1225,6 +1392,21 @@ class TelegramListener:
 
     async def _refresh_outgoing_read_status(self, snapshot: CardSnapshot) -> None:
         if not snapshot.is_outgoing:
+            read_skip(
+                logger,
+                "非 outgoing 卡片 feishu_msg=%s chat=%s",
+                snapshot.feishu_message_id,
+                snapshot.tg_chat_id,
+            )
+            return
+        if self.feishu.api_rate_limited:
+            read_skip(
+                logger,
+                "TG→飞书 限流中跳过 PATCH feishu_msg=%s chat=%s tg_msg=%s",
+                snapshot.feishu_message_id,
+                snapshot.tg_chat_id,
+                snapshot.tg_msg_id,
+            )
             return
 
         if snapshot.is_group:
@@ -1233,6 +1415,14 @@ class TelegramListener:
             read_status = await self._fetch_private_read_status(snapshot)
 
         if read_status is None:
+            read_skip(
+                logger,
+                "TG 已读查询无结果 feishu_msg=%s chat=%s tg_msg=%s group=%s",
+                snapshot.feishu_message_id,
+                snapshot.tg_chat_id,
+                snapshot.tg_msg_id,
+                snapshot.is_group,
+            )
             return
 
         previous = ReadStatus.from_json(snapshot.read_status_json)
@@ -1241,8 +1431,18 @@ class TelegramListener:
                 is_read=read_status.is_read,
                 read_ts=read_status.read_ts,
                 readers=merge_read_participants(read_status.readers, previous.readers),
+                ui_expanded=previous.ui_expanded,
             )
         if read_status_equal(read_status, previous):
+            read_skip(
+                logger,
+                "TG→飞书 状态无变化 feishu_msg=%s chat=%s tg_msg=%s read=%s readers=%d",
+                snapshot.feishu_message_id,
+                snapshot.tg_chat_id,
+                snapshot.tg_msg_id,
+                read_status.is_read,
+                len(read_status.readers),
+            )
             return
 
         self.message_store.update_read_status(
@@ -1263,17 +1463,30 @@ class TelegramListener:
             read_status_json=read_status.to_json(),
             tg_read_synced=snapshot.tg_read_synced,
         )
-        await self._patch_card_snapshot(updated)
-        logger.info(
-            "TG→飞书已读更新 chat=%s msg=%s read=%s readers=%d",
+        patched = await self._patch_card_snapshot(updated)
+        if not patched:
+            read_skip(
+                logger,
+                "TG→飞书 PATCH 失败 feishu_msg=%s chat=%s tg_msg=%s",
+                snapshot.feishu_message_id,
+                snapshot.tg_chat_id,
+                snapshot.tg_msg_id,
+            )
+            return
+        read_log(
+            logger,
+            "TG→飞书已读更新 chat=%s msg=%s read=%s readers=%d feishu_msg=%s",
             snapshot.tg_chat_id,
             snapshot.tg_msg_id,
             read_status.is_read,
             len(read_status.readers),
+            snapshot.feishu_message_id,
         )
 
     def _start_incoming_read_watch(self, feishu_message_id: str) -> None:
         if not self.config.get("read_sync_enabled"):
+            return
+        if not self.config.get("read_watch_enabled"):
             return
         if feishu_message_id in self._read_watches:
             return
@@ -1282,6 +1495,8 @@ class TelegramListener:
 
     def _start_outgoing_read_watch(self, feishu_message_id: str) -> None:
         if not self.config.get("read_sync_enabled"):
+            return
+        if not self.config.get("read_watch_enabled"):
             return
         if feishu_message_id in self._read_watches:
             return
@@ -1294,6 +1509,9 @@ class TelegramListener:
             for _ in range(60):
                 if not self._running:
                     return
+                if self.feishu.api_rate_limited:
+                    await asyncio.sleep(interval)
+                    continue
                 snapshot = self.message_store.get_card_snapshot(feishu_message_id)
                 if not snapshot or snapshot.tg_read_synced:
                     return
@@ -1317,6 +1535,9 @@ class TelegramListener:
             for _ in range(360):
                 if not self._running:
                     return
+                if self.feishu.api_rate_limited:
+                    await asyncio.sleep(interval)
+                    continue
                 snapshot = self.message_store.get_card_snapshot(feishu_message_id)
                 if not snapshot or not snapshot.is_outgoing:
                     return
@@ -1422,13 +1643,24 @@ class TelegramListener:
     async def _on_tg_message_read(self, event: events.MessageRead.Event) -> None:
         if not self.config.get("read_sync_enabled") or not event.outbox:
             return
+        if self.feishu.api_rate_limited:
+            read_skip(logger, "TG→飞书 限流中跳过 chat=%s", event.chat_id)
+            return
 
         if not event.max_id:
+            read_skip(logger, "TG→飞书 无 max_id chat=%s", event.chat_id)
             return
 
         snapshots = self.message_store.list_outgoing_cards_up_to(
             event.chat_id,
             event.max_id,
+        )
+        read_log(
+            logger,
+            "TG MessageRead chat=%s max_id=%s outgoing_cards=%d",
+            event.chat_id,
+            event.max_id,
+            len(snapshots),
         )
         for snapshot in snapshots:
             await self._refresh_outgoing_read_status(snapshot)
@@ -1436,6 +1668,35 @@ class TelegramListener:
         latest = self.message_store.get_card_by_tg(event.chat_id, event.max_id)
         if latest and latest.is_outgoing:
             await self._refresh_outgoing_read_status(latest)
+
+        if snapshots:
+            asyncio.create_task(
+                self._delayed_refresh_outgoing_read(
+                    [snapshot.feishu_message_id for snapshot in snapshots],
+                    delay=3.0,
+                )
+            )
+
+    async def _delayed_refresh_outgoing_read(
+        self,
+        feishu_message_ids: list[str],
+        *,
+        delay: float = 3.0,
+    ) -> None:
+        """MessageRead 后延迟重查，避免 TG API 读者列表尚未就绪。"""
+        await asyncio.sleep(delay)
+        if not self._running:
+            return
+        read_log(
+            logger,
+            "延迟重查 TG 已读 count=%d delay=%ss",
+            len(feishu_message_ids),
+            delay,
+        )
+        for feishu_message_id in feishu_message_ids:
+            snapshot = self.message_store.get_card_snapshot(feishu_message_id)
+            if snapshot and snapshot.is_outgoing:
+                await self._refresh_outgoing_read_status(snapshot)
 
     def _feishu_reader_allowed(self, reader_open_id: str) -> bool:
         allowed = set(self.config.get("feishu_allowed_open_ids", []))
@@ -1448,11 +1709,49 @@ class TelegramListener:
         feishu_message_id: str,
         *,
         reader_open_id: str = "",
+        via_reply: bool = False,
     ) -> None:
         snapshot = self.message_store.get_card_snapshot(feishu_message_id)
-        if snapshot is None or snapshot.is_outgoing or snapshot.tg_read_synced:
+        if snapshot is None:
+            read_skip(logger, "飞书→TG 无映射 feishu_msg=%s", feishu_message_id)
+            return
+        if snapshot.is_outgoing:
+            read_skip(
+                logger,
+                "飞书→TG 跳过 outgoing feishu_msg=%s chat=%s",
+                feishu_message_id,
+                snapshot.tg_chat_id,
+            )
+            return
+        if (
+            not snapshot.is_group
+            and not via_reply
+            and not self.config.get("read_sync_dm_on_view", False)
+        ):
+            read_skip(
+                logger,
+                "飞书→TG 私聊仅回复时同步已读（READ_SYNC_DM_ON_VIEW=false）"
+                " feishu_msg=%s tg_user=%s",
+                feishu_message_id,
+                snapshot.tg_chat_id,
+            )
+            return
+        if snapshot.tg_read_synced:
+            read_skip(
+                logger,
+                "飞书→TG 已同步过 chat=%s tg_msg=%s feishu_msg=%s",
+                snapshot.tg_chat_id,
+                snapshot.tg_msg_id,
+                feishu_message_id,
+            )
             return
         if reader_open_id and not self._feishu_reader_allowed(reader_open_id):
+            read_skip(
+                logger,
+                "飞书→TG 读者不在白名单 reader=%s feishu_msg=%s",
+                reader_open_id,
+                feishu_message_id,
+            )
             return
 
         try:
@@ -1461,18 +1760,96 @@ class TelegramListener:
                 max_id=snapshot.tg_msg_id,
             )
             self.message_store.mark_tg_read_synced(feishu_message_id)
-            logger.info(
-                "飞书→TG 已读同步 chat=%s msg=%s reader=%s",
+            read_log(
+                logger,
+                "飞书→TG 已读同步 chat=%s tg_msg=%s feishu_msg=%s reader=%s",
                 snapshot.tg_chat_id,
                 snapshot.tg_msg_id,
+                feishu_message_id,
                 reader_open_id or "-",
             )
         except Exception:
             logger.exception(
-                "飞书→TG 已读同步失败 chat=%s msg=%s",
+                "飞书→TG 已读同步失败 chat=%s msg=%s feishu_msg=%s",
                 snapshot.tg_chat_id,
                 snapshot.tg_msg_id,
+                feishu_message_id,
             )
+
+    async def _sync_incoming_chat_read_for_tg_chat(
+        self,
+        tg_chat_id: int,
+        *,
+        reader_open_id: str = "",
+        trigger: str = "",
+    ) -> list[str]:
+        """同 TG 会话所有未读入站消息一并标已读（与会话已读行为一致）。"""
+        if reader_open_id and not self._feishu_reader_allowed(reader_open_id):
+            read_skip(
+                logger,
+                "飞书→TG 读者不在白名单 reader=%s chat=%s",
+                reader_open_id,
+                tg_chat_id,
+            )
+            return []
+
+        pending = self.message_store.list_incoming_unsynced_for_tg_chat(tg_chat_id)
+        if not pending:
+            read_skip(
+                logger,
+                "飞书→TG 会话无未读 chat=%s trigger=%s",
+                tg_chat_id,
+                trigger or "-",
+            )
+            return []
+
+        max_msg_id = max(item.tg_msg_id for item in pending)
+        try:
+            await self.client.send_read_acknowledge(
+                tg_chat_id,
+                max_id=max_msg_id,
+            )
+        except Exception:
+            logger.exception(
+                "飞书→TG 会话已读失败 chat=%s max_msg=%s",
+                tg_chat_id,
+                max_msg_id,
+            )
+            return []
+
+        synced_ids: list[str] = []
+        for item in pending:
+            self.message_store.mark_tg_read_synced(item.feishu_message_id)
+            synced_ids.append(item.feishu_message_id)
+        read_log(
+            logger,
+            "飞书→TG 会话已读 chat=%s max_msg=%s count=%d trigger=%s reader=%s",
+            tg_chat_id,
+            max_msg_id,
+            len(synced_ids),
+            trigger or "-",
+            reader_open_id or "-",
+        )
+        return synced_ids
+
+    async def _sync_incoming_chat_read_to_tg(
+        self,
+        feishu_message_id: str,
+        *,
+        reader_open_id: str = "",
+    ) -> list[str]:
+        """点 Rd / 回复卡片：以该卡片所属会话触发已读。"""
+        snapshot = self.message_store.get_card_snapshot(feishu_message_id)
+        if snapshot is None:
+            read_skip(logger, "飞书→TG 无映射 feishu_msg=%s", feishu_message_id)
+            return []
+        if snapshot.is_outgoing:
+            return []
+        return await self._sync_incoming_chat_read_for_tg_chat(
+            snapshot.tg_chat_id,
+            reader_open_id=reader_open_id,
+            trigger=feishu_message_id,
+        )
 
     async def _handle_feishu_message_read(
         self,
@@ -1480,30 +1857,147 @@ class TelegramListener:
         reader_open_id: str,
         _read_ts: float,
     ) -> None:
+        if self.config.get("read_sync_card_buttons"):
+            read_skip(
+                logger,
+                "已启用卡片按钮，忽略飞书 message_read 事件 count=%d",
+                len(message_ids),
+            )
+            return
+        read_log(
+            logger,
+            "处理飞书已读事件 reader=%s count=%d ids=%s",
+            reader_open_id,
+            len(message_ids),
+            ",".join(message_ids[:5]) + ("..." if len(message_ids) > 5 else ""),
+        )
         for message_id in message_ids:
             await self._sync_feishu_read_to_tg(
                 message_id,
                 reader_open_id=reader_open_id,
             )
 
+    async def _patch_synced_cards_background(
+        self,
+        feishu_message_ids: list[str],
+    ) -> None:
+        interval = max(float(self.config.get("feishu_api_min_interval", 1.0)), 0.5)
+        for feishu_message_id in feishu_message_ids:
+            if not self._running:
+                return
+            snapshot = self.message_store.get_card_snapshot(feishu_message_id)
+            if snapshot is None or not snapshot.tg_read_synced:
+                continue
+            await self._patch_card_snapshot(snapshot)
+            await asyncio.sleep(interval)
+
+    async def _handle_feishu_card_action(
+        self,
+        feishu_message_id: str,
+        value: dict,
+        reader_open_id: str,
+    ) -> tuple[str, dict | None]:
+        if not self.config.get("read_sync_enabled"):
+            return "未启用已读同步", None
+
+        action = str(value.get("action", "")).strip()
+        snapshot = self.message_store.get_card_snapshot(feishu_message_id)
+        if snapshot is None:
+            return "找不到消息映射", None
+
+        if action == "read_one":
+            if snapshot.is_outgoing:
+                return "", None
+            if reader_open_id and not self._feishu_reader_allowed(reader_open_id):
+                return "无操作权限", None
+            pending = self.message_store.list_incoming_unsynced_for_tg_chat(
+                snapshot.tg_chat_id
+            )
+            if not pending:
+                return "", None
+            for item in pending:
+                self.message_store.mark_tg_read_synced(item.feishu_message_id)
+            all_ids = [item.feishu_message_id for item in pending]
+            asyncio.create_task(
+                self._complete_read_one_to_tg(snapshot, pending, all_ids)
+            )
+            return "", None
+
+        return "未知操作", None
+
+    async def _complete_read_one_to_tg(
+        self,
+        snapshot: CardSnapshot,
+        pending: list[CardSnapshot],
+        feishu_message_ids: list[str],
+    ) -> None:
+        """read_one 回调已响应 {} 后：PATCH 去掉 ✓，再同步 TG 已读。"""
+        for feishu_message_id in feishu_message_ids:
+            if not self._running:
+                return
+            updated = self.message_store.get_card_snapshot(feishu_message_id)
+            if updated:
+                await self._patch_card_snapshot(updated)
+            interval = max(float(self.config.get("feishu_api_min_interval", 1.0)), 0.5)
+            if len(feishu_message_ids) > 1:
+                await asyncio.sleep(interval)
+
+        max_msg_id = max(item.tg_msg_id for item in pending)
+        try:
+            await self.client.send_read_acknowledge(
+                snapshot.tg_chat_id,
+                max_id=max_msg_id,
+            )
+            read_log(
+                logger,
+                "飞书→TG 会话已读 chat=%s max_msg=%s count=%d trigger=%s",
+                snapshot.tg_chat_id,
+                max_msg_id,
+                len(pending),
+                snapshot.feishu_message_id,
+            )
+        except Exception:
+            logger.exception(
+                "飞书→TG 会话已读失败 chat=%s max_msg=%s",
+                snapshot.tg_chat_id,
+                max_msg_id,
+            )
+            return
+
     async def _poll_read_status_loop(self) -> None:
         interval = max(int(self.config.get("read_poll_interval", 15)), 10)
+        batch_size = max(int(self.config.get("read_poll_batch_size", 8)), 1)
+        outgoing_batch = max(int(self.config.get("read_poll_outgoing_batch", 5)), 1)
+        startup_delay = max(int(self.config.get("read_poll_startup_delay", 30)), 0)
+        if startup_delay:
+            read_log(
+                logger,
+                "已读轮询将在 %d 秒后启动，避免重启后挤占飞书 API 配额",
+                startup_delay,
+            )
+            await asyncio.sleep(startup_delay)
         while self._running:
             try:
                 await asyncio.sleep(interval)
                 if not self.config.get("read_sync_enabled"):
                     continue
+                if self.feishu.api_rate_limited:
+                    logger.warning("飞书 API 限流中，跳过本轮已读轮询")
+                    continue
 
-                pending = self.message_store.list_incoming_unsynced_tg_read()
+                pending = self.message_store.list_incoming_unsynced_tg_read(limit=batch_size)
                 if pending:
                     logger.debug("已读轮询: %d 条入站消息待同步到 TG", len(pending))
                 for snapshot in pending:
+                    if self.feishu.api_rate_limited:
+                        break
                     readers = await self.feishu.get_message_read_users(
                         snapshot.feishu_message_id
                     )
                     if readers:
-                        logger.info(
-                            "飞书已读查询 message_id=%s readers=%d",
+                        read_log(
+                            logger,
+                            "飞书已读查询 feishu_msg=%s readers=%d",
                             snapshot.feishu_message_id,
                             len(readers),
                         )
@@ -1515,10 +2009,18 @@ class TelegramListener:
                             )
                             break
 
-                for snapshot in self.message_store.list_recent_outgoing_group_cards():
+                for snapshot in self.message_store.list_recent_outgoing_group_cards(
+                    limit=outgoing_batch
+                ):
+                    if self.feishu.api_rate_limited:
+                        break
                     await self._refresh_outgoing_read_status(snapshot)
 
-                for snapshot in self.message_store.list_recent_outgoing_private_cards():
+                for snapshot in self.message_store.list_recent_outgoing_private_cards(
+                    limit=outgoing_batch
+                ):
+                    if self.feishu.api_rate_limited:
+                        break
                     await self._refresh_outgoing_read_status(snapshot)
             except asyncio.CancelledError:
                 break
@@ -1618,10 +2120,25 @@ class TelegramListener:
         image_keys: list[str],
     ) -> None:
         if parent_message_id and self.config.get("read_sync_enabled"):
-            await self._sync_feishu_read_to_tg(
+            read_log(
+                logger,
+                "飞书回复触发会话已读 parent=%s sender=%s",
+                parent_message_id,
+                sender_open_id,
+            )
+            synced_ids = await self._sync_incoming_chat_read_to_tg(
                 parent_message_id,
                 reader_open_id=sender_open_id,
             )
+            if self.config.get("read_sync_card_buttons") and synced_ids:
+                others = [
+                    mid for mid in synced_ids if mid != parent_message_id
+                ]
+                parent_snap = self.message_store.get_card_snapshot(parent_message_id)
+                if parent_snap and parent_snap.tg_read_synced:
+                    asyncio.create_task(self._patch_card_snapshot(parent_snap))
+                if others:
+                    asyncio.create_task(self._patch_synced_cards_background(others))
 
         image_paths = await self._download_feishu_images(feishu_message_id, image_keys)
         if image_keys and not image_paths:
@@ -1634,6 +2151,24 @@ class TelegramListener:
         # 群聊：在对应飞书群里直接发消息即可回到 TG 群
         if feishu_chat_id in self.feishu_to_tg:
             tg_chat_id = self.feishu_to_tg[feishu_chat_id]
+
+            if self.config.get("read_sync_enabled") and not parent_message_id:
+                read_log(
+                    logger,
+                    "飞书群直接发送触发会话已读 chat=%s sender=%s",
+                    tg_chat_id,
+                    sender_open_id,
+                )
+                synced_ids = await self._sync_incoming_chat_read_for_tg_chat(
+                    tg_chat_id,
+                    reader_open_id=sender_open_id,
+                    trigger=feishu_message_id,
+                )
+                if self.config.get("read_sync_card_buttons") and synced_ids:
+                    asyncio.create_task(
+                        self._patch_synced_cards_background(synced_ids)
+                    )
+
             final_text = reply_text
             reply_to: int | None = None
             formatting_entities: list[TypeMessageEntity] | None = None
@@ -1706,39 +2241,65 @@ class TelegramListener:
                     image_path.unlink(missing_ok=True)
             return
 
-        # 私聊汇总群：必须回复某人的消息卡片
+        # 私聊汇总群：可回复卡片指定联系人，否则发到最近入站私聊用户
         if self.feishu_dm_chat_id and feishu_chat_id == self.feishu_dm_chat_id:
-            if not parent_message_id:
-                await self.feishu.send_bot_text(
-                    "私聊汇总群请使用「回复」功能：点某人的转发消息卡片再发送，才能回到对应 TG 私聊。",
-                    feishu_chat_id,
+            tg_chat_id: int | None = None
+            if parent_message_id:
+                mapping = self.message_store.get(parent_message_id)
+                if mapping is None:
+                    logger.warning("未找到私聊映射 parent_id=%s", parent_message_id)
+                    await self.feishu.send_bot_text(
+                        "未能回复：请直接回复机器人转发的那条消息卡片。",
+                        feishu_chat_id,
+                    )
+                    for image_path in image_paths:
+                        image_path.unlink(missing_ok=True)
+                    return
+                tg_chat_id = mapping.tg_chat_id
+            else:
+                tg_chat_id = self.message_store.get_latest_incoming_private_chat_id()
+                if not tg_chat_id:
+                    await self.feishu.send_bot_text(
+                        "暂无可回复的私聊：请先收到对方消息，或使用「回复」指定联系人。",
+                        feishu_chat_id,
+                    )
+                    for image_path in image_paths:
+                        image_path.unlink(missing_ok=True)
+                    return
+                logger.info(
+                    "私聊未回复发送：路由到最近入站用户 chat=%s",
+                    tg_chat_id,
                 )
-                for image_path in image_paths:
-                    image_path.unlink(missing_ok=True)
-                return
 
-            mapping = self.message_store.get(parent_message_id)
-            if mapping is None:
-                logger.warning("未找到私聊映射 parent_id=%s", parent_message_id)
-                await self.feishu.send_bot_text(
-                    "未能回复：请直接回复机器人转发的那条消息卡片。",
-                    feishu_chat_id,
+            if self.config.get("read_sync_enabled") and not parent_message_id:
+                read_log(
+                    logger,
+                    "飞书私聊直接发送触发会话已读 chat=%s sender=%s",
+                    tg_chat_id,
+                    sender_open_id,
                 )
-                for image_path in image_paths:
-                    image_path.unlink(missing_ok=True)
-                return
+                synced_ids = await self._sync_incoming_chat_read_for_tg_chat(
+                    tg_chat_id,
+                    reader_open_id=sender_open_id,
+                    trigger=feishu_message_id,
+                )
+                if self.config.get("read_sync_card_buttons") and synced_ids:
+                    asyncio.create_task(
+                        self._patch_synced_cards_background(synced_ids)
+                    )
 
             try:
                 sent_ids = await self._send_content_to_tg(
-                    mapping.tg_chat_id,
+                    tg_chat_id,
                     reply_text,
                     image_paths,
                 )
                 logger.info(
-                    "私聊已发到 TG chat=%s msg_ids=%s images=%d",
-                    mapping.tg_chat_id,
+                    "私聊已发到 TG chat=%s msg_ids=%s images=%d parent=%s",
+                    tg_chat_id,
                     ",".join(str(item) for item in sent_ids) if sent_ids else "-",
                     len(image_paths),
+                    parent_message_id or "-",
                 )
                 if sent_ids:
                     me = await self.client.get_me()
@@ -1749,7 +2310,7 @@ class TelegramListener:
                     echo_body = reply_text or ("[图片]" if image_paths else "")
                     await self._after_feishu_send_to_tg(
                         feishu_message_id=feishu_message_id,
-                        tg_chat_id=mapping.tg_chat_id,
+                        tg_chat_id=tg_chat_id,
                         tg_msg_ids=sent_ids,
                         echo_time=echo_time,
                         echo_info=echo_info,
@@ -1757,9 +2318,8 @@ class TelegramListener:
                     )
             except Exception:
                 logger.exception(
-                    "私聊回复 TG 失败 user=%s msg=%s",
-                    mapping.tg_chat_id,
-                    mapping.tg_msg_id,
+                    "私聊回复 TG 失败 user=%s",
+                    tg_chat_id,
                 )
                 await self.feishu.send_bot_text(
                     "❌ 回复 Telegram 私聊失败，请稍后重试。",
@@ -1783,7 +2343,8 @@ class TelegramListener:
         direction = "发出" if event.out else "收到"
 
         if is_log_verbose():
-            logger.info(
+            forward_log(
+                logger,
                 "TG消息 [%s] chat=%s msg=%s text=%r media=%s",
                 direction,
                 event.chat_id,
@@ -1792,7 +2353,8 @@ class TelegramListener:
                 media_label or "none",
             )
         else:
-            logger.info(
+            forward_log(
+                logger,
                 "TG消息 [%s] chat=%s msg=%s media=%s",
                 direction,
                 event.chat_id,
@@ -1801,33 +2363,46 @@ class TelegramListener:
             )
 
         if event.out and self._should_skip_feishu_echo(event.chat_id, event.message.id):
-            logger.info(
-                "跳过 Feishu 发出消息的 TG 回显 chat=%s msg=%s",
+            forward_skip(
+                logger,
+                "Feishu 发出消息的 TG 回显 chat=%s msg=%s",
                 event.chat_id,
                 event.message.id,
             )
             return
 
         if event.out and self.config.get("incoming_only", True):
-            logger.info("跳过：自己发出的消息（如需转发请设 INCOMING_ONLY=false）")
+            forward_skip(
+                logger,
+                "自己发出的消息（如需转发请设 INCOMING_ONLY=false）chat=%s msg=%s",
+                event.chat_id,
+                event.message.id,
+            )
             return
 
         if not self._should_forward(event):
-            logger.info("跳过：不在监听范围 chat_id=%s", event.chat_id)
+            forward_skip(
+                logger,
+                "不在监听范围 chat_id=%s msg=%s",
+                event.chat_id,
+                event.message.id,
+            )
             return
 
         time_str, info, body = await format_message(event, self.client, self.chat_titles)
-        if is_log_verbose():
-            logger.info("转发到 Lark chat=%s msg=%s info=%s", event.chat_id, event.message.id, info)
-        else:
-            logger.info("转发到 Lark chat=%s msg=%s", event.chat_id, event.message.id)
+        forward_log(
+            logger,
+            "转发到 Lark chat=%s msg=%s outgoing=%s",
+            event.chat_id,
+            event.message.id,
+            event.out,
+        )
 
         sender = event.sender
         if sender is None:
             with contextlib.suppress(Exception):
                 sender = await event.get_sender()
         tg_sender_id, tg_sender_username, tg_sender_name = _sender_info_from_user(sender)
-        avatar_key = await self._get_sender_avatar_key(sender)
 
         media_paths: list[Path] = []
         image_keys: list[str] = []
@@ -1842,6 +2417,8 @@ class TelegramListener:
                         body = ""
                 else:
                     logger.debug("未配置 FEISHU_APP_ID/SECRET，跳过图片转发")
+
+            avatar_key = await self._get_sender_avatar_key(sender)
 
             success = await self._deliver_to_feishu(
                 time_str=time_str,
@@ -1862,7 +2439,34 @@ class TelegramListener:
                     media_path.unlink(missing_ok=True)
 
         if success:
-            logger.info("已转发消息 chat_id=%s msg_id=%s", event.chat_id, event.message.id)
+            forward_log(
+                logger,
+                "已转发消息 chat_id=%s msg_id=%s outgoing=%s",
+                event.chat_id,
+                event.message.id,
+                event.out,
+            )
+        elif self.feishu.api_rate_limited:
+            logger.warning(
+                "转发因限流失败，已安排重试 chat=%s msg=%s",
+                event.chat_id,
+                event.message.id,
+            )
+            asyncio.create_task(
+                self._retry_deliver(
+                    time_str=time_str,
+                    info=info,
+                    body=body,
+                    image_keys=image_keys,
+                    tg_chat_id=event.chat_id,
+                    tg_msg_id=event.message.id,
+                    tg_sender_id=tg_sender_id,
+                    tg_sender_username=tg_sender_username,
+                    tg_sender_name=tg_sender_name,
+                    avatar_key=avatar_key,
+                    is_outgoing=event.out,
+                )
+            )
         else:
             logger.error("转发失败 chat_id=%s msg_id=%s", event.chat_id, event.message.id)
 
@@ -1923,7 +2527,6 @@ class TelegramListener:
             with contextlib.suppress(Exception):
                 sender = await first.get_sender()
         tg_sender_id, tg_sender_username, tg_sender_name = _sender_info_from_user(sender)
-        avatar_key = await self._get_sender_avatar_key(sender)
 
         media_paths: list[Path] = []
         image_keys: list[str] = []
@@ -1937,6 +2540,8 @@ class TelegramListener:
                     body = ""
             else:
                 logger.debug("未配置 FEISHU_APP_ID/SECRET，跳过图片转发")
+
+            avatar_key = await self._get_sender_avatar_key(sender)
 
             success = await self._deliver_to_feishu(
                 time_str=time_str,
@@ -1959,6 +2564,27 @@ class TelegramListener:
         msg_ids = ",".join(str(m.id) for m in event.messages)
         if success:
             logger.info("已转发相册 chat_id=%s msg_ids=%s", event.chat_id, msg_ids)
+        elif self.feishu.api_rate_limited:
+            logger.warning(
+                "相册转发因限流失败，已安排重试 chat=%s msg=%s",
+                event.chat_id,
+                first.id,
+            )
+            asyncio.create_task(
+                self._retry_deliver(
+                    time_str=time_str,
+                    info=info,
+                    body=body,
+                    image_keys=image_keys,
+                    tg_chat_id=event.chat_id,
+                    tg_msg_id=first.id,
+                    tg_sender_id=tg_sender_id,
+                    tg_sender_username=tg_sender_username,
+                    tg_sender_name=tg_sender_name,
+                    avatar_key=avatar_key,
+                    is_outgoing=first.out,
+                )
+            )
         else:
             logger.error("转发相册失败 chat_id=%s msg_ids=%s", event.chat_id, msg_ids)
 
@@ -2030,7 +2656,20 @@ class TelegramListener:
         mode = "仅他人消息" if incoming_only else "全部消息(含自己)"
         logger.info("消息监听模式: %s", mode)
         if self.config.get("read_sync_enabled"):
-            logger.info("已读同步: 已启用（TG↔飞书）")
+            channels = ["TG MessageRead 事件"]
+            if self.config.get("read_sync_card_buttons"):
+                channels.append("卡片按钮(飞书→TG)")
+            else:
+                channels.append("飞书已读事件")
+            if self.config.get("read_watch_enabled"):
+                channels.append("快速监听")
+            if self.config.get("read_poll_enabled"):
+                channels.append("兜底轮询")
+            logger.info("已读同步: 已启用（%s）", " + ".join(channels))
+            if self.config.get("read_debug"):
+                logger.warning(
+                    "排查日志已开启（READ_DEBUG=true），严格模式下可见 [转发] / [已读] / [·跳过] 日志"
+                )
 
     async def run_once(self) -> None:
         await self._ensure_login()
@@ -2061,11 +2700,12 @@ class TelegramListener:
                 title = self.chat_titles.get(tg_id, str(tg_id))
                 logger.info("飞书群映射: TG %s (%s) -> %s", title, tg_id, feishu_id)
         logger.warning(
-            "服务运行中 | TG=%s | 群=%s | 飞书回调 :%s | 日志级别=%s",
+            "服务运行中 | TG=%s | 群=%s | 飞书回调 :%s | 日志级别=%s | 已读排查=%s",
             me.first_name,
             group_desc,
             self.config.get("feishu_event_port", 8080),
             self.config.get("log_level", "WARNING"),
+            "开" if self.config.get("read_debug") else "关",
         )
         logger.info(
             "监听已启动 | 用户: %s | 私聊: 全部 | 群聊: %s | 图片转发: %s | 代理: %s | 飞书回复: %s",
@@ -2090,6 +2730,12 @@ class TelegramListener:
                 on_message_read=(
                     self._handle_feishu_message_read
                     if self.config.get("read_sync_enabled")
+                    else None
+                ),
+                on_card_action=(
+                    self._handle_feishu_card_action
+                    if self.config.get("read_sync_enabled")
+                    and self.config.get("read_sync_card_buttons")
                     else None
                 ),
                 path=self.config.get("feishu_event_path", "/feishu/event"),
@@ -2117,7 +2763,7 @@ class TelegramListener:
             and self.config.get("group_refresh_interval", 300) > 0
         ):
             refresh_task = asyncio.create_task(self._unmuted_groups_refresh_loop())
-        if self.config.get("read_sync_enabled"):
+        if self.config.get("read_sync_enabled") and self.config.get("read_poll_enabled"):
             read_poll_task = asyncio.create_task(self._poll_read_status_loop())
         if max(int(self.config.get("log_cleanup_interval", 24)), 0) > 0:
             log_cleanup_task = asyncio.create_task(self._log_cleanup_loop())

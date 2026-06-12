@@ -340,6 +340,37 @@ class MessageMappingStore:
             ).fetchall()
         return [self._row_to_card_snapshot(row) for row in rows]
 
+    def list_incoming_unsynced_for_tg_chat(
+        self,
+        tg_chat_id: int,
+        *,
+        limit: int = 100,
+    ) -> list[CardSnapshot]:
+        seen: set[str] = set()
+        snapshots: list[CardSnapshot] = []
+        with self._connect() as conn:
+            for cid in tg_chat_id_variants(tg_chat_id):
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM feishu_card_snapshots
+                    WHERE tg_chat_id = ?
+                      AND is_outgoing = 0
+                      AND tg_read_synced = 0
+                    ORDER BY tg_msg_id ASC
+                    LIMIT ?
+                    """,
+                    (cid, limit),
+                ).fetchall()
+                for row in rows:
+                    feishu_message_id = row["feishu_message_id"]
+                    if feishu_message_id in seen:
+                        continue
+                    seen.add(feishu_message_id)
+                    snapshots.append(self._row_to_card_snapshot(row))
+        snapshots.sort(key=lambda item: item.tg_msg_id)
+        return snapshots
+
     def list_recent_outgoing_group_cards(self, limit: int = 40) -> list[CardSnapshot]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -371,6 +402,24 @@ class MessageMappingStore:
                 (time.time() - 7 * 86400, limit),
             ).fetchall()
         return [self._row_to_card_snapshot(row) for row in rows]
+
+    def get_latest_incoming_private_chat_id(self) -> int | None:
+        """最近一条入站私聊的 TG 用户 chat_id（用于未回复直接发送）。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT tg_chat_id
+                FROM feishu_card_snapshots
+                WHERE is_outgoing = 0
+                  AND is_group = 0
+                  AND tg_chat_id > 0
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return int(row["tg_chat_id"])
 
     def update_read_status(self, feishu_message_id: str, read_status_json: str) -> None:
         with self._connect() as conn:

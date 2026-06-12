@@ -13,6 +13,7 @@ from typing import Any, Optional
 from aiohttp import web
 
 from feishu_client import FeishuClient
+from log_config import read_log, read_skip
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,11 @@ FeishuMessageHandler = Callable[
 FeishuMessageReadHandler = Callable[
     [list[str], str, float],
     Awaitable[None],
+]
+
+FeishuCardActionHandler = Callable[
+    [str, dict[str, Any], str],
+    Awaitable[tuple[str, dict[str, Any] | None]],
 ]
 
 # 飞书回复时自带的内部 @ 占位符（如 @_user_1），不是 TG 用户名
@@ -88,6 +94,7 @@ class FeishuEventServer:
         allowed_open_ids: set[str] | None = None,
         on_message: FeishuMessageHandler | None = None,
         on_message_read: FeishuMessageReadHandler | None = None,
+        on_card_action: FeishuCardActionHandler | None = None,
         path: str = "/feishu/event",
     ) -> None:
         self.feishu = feishu
@@ -98,6 +105,7 @@ class FeishuEventServer:
         self.allowed_open_ids = allowed_open_ids or set()
         self.on_message = on_message
         self.on_message_read = on_message_read
+        self.on_card_action = on_card_action
         self.path = path if path.startswith("/") else f"/{path}"
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -153,10 +161,10 @@ class FeishuEventServer:
 
         event_type = header.get("event_type", "")
         if event_type == "card.action.trigger":
-            return web.json_response({})
+            return await self._handle_card_action(payload)
 
         if event_type == "im.message.message_read_v1" and self.on_message_read:
-            logger.info("收到飞书消息已读事件")
+            read_log(logger, "收到飞书消息已读事件")
             asyncio.create_task(
                 self._process_message_read_safe(payload.get("event", {}))
             )
@@ -167,6 +175,126 @@ class FeishuEventServer:
             )
 
         return web.json_response({})
+
+    @staticmethod
+    def _parse_action_value(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return {}
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return {"action": text}
+            return parsed if isinstance(parsed, dict) else {"action": text}
+        return {}
+
+    async def _handle_card_action(self, payload: dict[str, Any]) -> web.Response:
+        event = payload.get("event", {})
+        context = event.get("context", {})
+        open_message_id = str(context.get("open_message_id", "")).strip()
+        operator = event.get("operator") or {}
+        reader_open_id = str(operator.get("open_id", "")).strip()
+        action = event.get("action") or {}
+        value = self._parse_action_value(action.get("value"))
+
+        if self.allowed_open_ids and reader_open_id not in self.allowed_open_ids:
+            return web.json_response(
+                {
+                    "toast": {
+                        "type": "error",
+                        "content": "无操作权限",
+                    }
+                }
+            )
+
+        if not self.on_card_action or not open_message_id:
+            return web.json_response(
+                {
+                    "toast": {
+                        "type": "error",
+                        "content": "卡片操作未启用",
+                    }
+                }
+            )
+
+        action_name = str(value.get("action", "")).strip()
+        if action_name == "read_one":
+            read_log(
+                logger,
+                "卡片按钮 action=%s feishu_msg=%s operator=%s",
+                action_name,
+                open_message_id,
+                reader_open_id,
+            )
+            asyncio.create_task(
+                self._finish_read_one_action(
+                    open_message_id,
+                    value,
+                    reader_open_id,
+                )
+            )
+            return web.json_response({})
+
+        read_log(
+            logger,
+            "卡片按钮 action=%s feishu_msg=%s operator=%s",
+            value.get("action", "-"),
+            open_message_id,
+            reader_open_id,
+        )
+        try:
+            toast, card = await self.on_card_action(
+                open_message_id,
+                value,
+                reader_open_id,
+            )
+        except Exception:
+            logger.exception("处理卡片按钮失败 feishu_msg=%s", open_message_id)
+            return web.json_response(
+                {
+                    "toast": {
+                        "type": "error",
+                        "content": "操作失败，请稍后重试",
+                    }
+                }
+            )
+
+        body: dict[str, Any] = {}
+        if toast:
+            body["toast"] = {"type": "error", "content": toast}
+        if card:
+            body["card"] = {"type": "raw", "data": card}
+        return web.json_response(body)
+
+    async def _finish_read_one_action(
+        self,
+        open_message_id: str,
+        value: dict[str, Any],
+        reader_open_id: str,
+    ) -> None:
+        """read_one：先响应 {} 结束 loading，再 PATCH 卡片并同步 TG。"""
+        await asyncio.sleep(0.05)
+        if not self.on_card_action:
+            return
+        try:
+            toast, _card = await self.on_card_action(
+                open_message_id,
+                value,
+                reader_open_id,
+            )
+        except Exception:
+            logger.exception("处理 read_one 失败 feishu_msg=%s", open_message_id)
+            return
+        if toast:
+            read_skip(
+                logger,
+                "read_one 失败 feishu_msg=%s err=%s",
+                open_message_id,
+                toast,
+            )
 
     async def _process_message_read_safe(self, event: dict[str, Any]) -> None:
         if not self.on_message_read:
@@ -181,7 +309,7 @@ class FeishuEventServer:
         reader_id = reader.get("reader_id") or {}
         reader_open_id = str(reader_id.get("open_id", "")).strip()
         if self.allowed_open_ids and reader_open_id not in self.allowed_open_ids:
-            logger.debug("跳过：飞书已读用户不在白名单 open_id=%s", reader_open_id)
+            read_skip(logger, "飞书已读用户不在白名单 open_id=%s", reader_open_id)
             return
 
         try:
@@ -195,12 +323,15 @@ class FeishuEventServer:
             if str(item).strip()
         ]
         if not message_ids:
+            read_skip(logger, "飞书已读事件 message_id_list 为空 reader=%s", reader_open_id)
             return
 
-        logger.info(
-            "飞书消息已读 reader=%s count=%d",
+        read_log(
+            logger,
+            "飞书消息已读 reader=%s count=%d ids=%s",
             reader_open_id,
             len(message_ids),
+            ",".join(message_ids[:5]) + ("..." if len(message_ids) > 5 else ""),
         )
         await self.on_message_read(message_ids, reader_open_id, read_ts)
 
@@ -236,13 +367,23 @@ class FeishuEventServer:
             logger.info("跳过：消息内容为空 chat_id=%s", feishu_chat_id)
             return
 
-        logger.info(
-            "飞书消息 -> TG feishu_chat=%s feishu_msg=%s parent=%s images=%d",
-            feishu_chat_id,
-            message_id,
-            parent_id or "-",
-            len(image_keys),
-        )
+        if parent_id:
+            read_log(
+                logger,
+                "飞书消息(含回复) -> TG feishu_chat=%s feishu_msg=%s parent=%s images=%d",
+                feishu_chat_id,
+                message_id,
+                parent_id,
+                len(image_keys),
+            )
+        else:
+            logger.info(
+                "飞书消息 -> TG feishu_chat=%s feishu_msg=%s parent=%s images=%d",
+                feishu_chat_id,
+                message_id,
+                parent_id or "-",
+                len(image_keys),
+            )
         await self.on_message(
             feishu_chat_id,
             reply_text,
