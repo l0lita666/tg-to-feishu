@@ -27,10 +27,12 @@ from telethon.tl.functions.messages import (
     GetMessageReadParticipantsRequest,
     GetOutboxReadDateRequest,
 )
+from telethon.tl.functions.users import GetUsersRequest
 from telethon.tl.types import (
     Channel,
     Chat,
     DocumentAttributeSticker,
+    InputUser,
     MessageEntityMentionName,
     MessageMediaDocument,
     MessageMediaPhoto,
@@ -331,6 +333,26 @@ def _user_display_name(user: User) -> str:
     if user.username:
         return f"@{user.username}"
     return str(user.id)
+
+
+async def _resolve_tg_user(client: TelegramClient, user_id: int) -> User | None:
+    """解析 TG 用户（已读头像/首字），get_entity 失败时回退 GetUsers。"""
+    if user_id <= 0:
+        return None
+    try:
+        entity = await client.get_entity(user_id)
+        if isinstance(entity, User):
+            return entity
+    except Exception:
+        pass
+    try:
+        result = await client(GetUsersRequest(id=[InputUser(user_id, access_hash=0)]))
+        for item in result.users:
+            if isinstance(item, User) and item.id == user_id:
+                return item
+    except Exception:
+        pass
+    return None
 
 
 def _sender_info_from_user(sender: object | None) -> tuple[int, str, str]:
@@ -1353,12 +1375,16 @@ class TelegramListener:
             if prev_reader:
                 name = prev_reader.name
                 avatar_key = prev_reader.avatar_key
+            if user_id and not name:
+                user = await _resolve_tg_user(self.client, user_id)
+                if user is not None:
+                    name = _user_display_name(user)
             if user_id and not avatar_key and not self.feishu.api_rate_limited:
-                with contextlib.suppress(Exception):
-                    user = await self.client.get_entity(user_id)
-                    if isinstance(user, User):
-                        name = name or _user_display_name(user)
-                        avatar_key = await self._get_sender_avatar_key(user) or ""
+                user = await _resolve_tg_user(self.client, user_id)
+                if user is not None:
+                    if not name:
+                        name = _user_display_name(user)
+                    avatar_key = await self._get_sender_avatar_key(user) or ""
             readers.append(
                 ReadParticipant(
                     user_id=user_id,

@@ -145,16 +145,9 @@ def format_read_suffix_html(
     is_outgoing: bool,
     is_group: bool,
 ) -> str:
-    """群聊发出且无头像已读时：meta 行末尾附加 ✓；其余已读展示在底栏。"""
-    if not is_outgoing:
-        return ""
-    status = read_status or ReadStatus()
-    if not is_group:
-        return ""
-    if status.readers:
-        return ""
-    suffix = _check_suffix(status.is_read, status.read_ts)
-    return f"<font color='grey'>{suffix}</font>"
+    """发出消息已读状态统一在底栏展示，标题行不再附加。"""
+    del read_status, is_outgoing, is_group
+    return ""
 
 
 def format_meta_with_read(
@@ -174,8 +167,17 @@ def format_meta_with_read(
     return f"{base} {suffix}" if suffix else base
 
 
-def _reader_initial_element(name: str) -> dict[str, Any]:
-    label = (name or "?").strip()[:1].upper() or "?"
+def _reader_fallback_label(name: str, user_id: int = 0) -> str:
+    label = (name or "").strip()
+    if label:
+        return label[:1].upper()
+    if user_id:
+        return str(user_id % 10)
+    return "·"
+
+
+def _reader_initial_element(name: str, *, user_id: int = 0) -> dict[str, Any]:
+    label = _reader_fallback_label(name, user_id)
     return {
         "tag": "div",
         "text": {
@@ -227,7 +229,7 @@ def _reader_receipt_column(
             _reader_avatar_element(reader.avatar_key, reader.name)
         ]
     else:
-        elements = [_reader_initial_element(reader.name)]
+        elements = [_reader_initial_element(reader.name, user_id=reader.user_id)]
     if show_time:
         time_element = _reader_time_element(reader.read_ts)
         if time_element:
@@ -286,34 +288,10 @@ def _build_reader_receipt_row(
     }
 
 
-def build_read_receipt_inner_column_set(
-    read_status: ReadStatus | None,
-    *,
-    is_outgoing: bool,
-    is_group: bool,
-) -> dict[str, Any] | None:
-    """已读展示（无左侧 spacer），供底栏右侧与发送时间并排。"""
-    if not is_outgoing:
-        return None
-
-    status = read_status or ReadStatus()
-
-    if is_group:
-        if not status.readers:
-            return None
-        shown = sorted(
-            status.readers,
-            key=lambda item: (item.read_ts or 0.0, item.user_id),
-        )[:MAX_READER_AVATARS]
-        extra = len(status.readers) - len(shown)
-        has_times = any(item.read_ts > 0 for item in status.readers)
-        return _build_reader_receipt_row(
-            shown,
-            extra=extra,
-            show_times=has_times,
-            leading_spacer=False,
-        )
-
+def _build_outgoing_check_column_set(
+    status: ReadStatus,
+) -> dict[str, Any]:
+    """发出消息底栏右侧：灰色 ✓ / ✓/ + 时间。"""
     check = CHECK_READ if status.is_read else CHECK_SENT
     elements: list[dict[str, Any]] = [
         {
@@ -344,6 +322,37 @@ def build_read_receipt_inner_column_set(
             }
         ],
     }
+
+
+def build_read_receipt_inner_column_set(
+    read_status: ReadStatus | None,
+    *,
+    is_outgoing: bool,
+    is_group: bool,
+) -> dict[str, Any] | None:
+    """已读展示（无左侧 spacer），供底栏右侧与发送时间并排。"""
+    if not is_outgoing:
+        return None
+
+    status = read_status or ReadStatus()
+
+    if is_group:
+        if status.readers:
+            shown = sorted(
+                status.readers,
+                key=lambda item: (item.read_ts or 0.0, item.user_id),
+            )[:MAX_READER_AVATARS]
+            extra = len(status.readers) - len(shown)
+            has_times = any(item.read_ts > 0 for item in status.readers)
+            return _build_reader_receipt_row(
+                shown,
+                extra=extra,
+                show_times=has_times,
+                leading_spacer=False,
+            )
+        return _build_outgoing_check_column_set(status)
+
+    return _build_outgoing_check_column_set(status)
 
 
 def build_read_receipt_elements(
