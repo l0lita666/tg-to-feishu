@@ -113,6 +113,9 @@ fi
 
 echo ">>> 配置防火墙 (UDP ${WG_PORT})..."
 ufw allow "${WG_PORT}/udp" >/dev/null 2>&1 || true
+# 飞书回调 / Nginx 依赖 80、443，启用 UFW 前必须放行
+ufw allow 80/tcp >/dev/null 2>&1 || true
+ufw allow 443/tcp >/dev/null 2>&1 || true
 # 确保 SSH 不被关
 ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1 || true
 echo "y" | ufw enable >/dev/null 2>&1 || true

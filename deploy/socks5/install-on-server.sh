@@ -81,6 +81,9 @@ systemctl restart "$SERVICE_NAME"
 
 echo ">>> 配置防火墙 (TCP ${SOCKS_PORT})..."
 ufw allow "${SOCKS_PORT}/tcp" >/dev/null 2>&1 || true
+# 飞书回调 / Nginx 依赖 80、443
+ufw allow 80/tcp >/dev/null 2>&1 || true
+ufw allow 443/tcp >/dev/null 2>&1 || true
 ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1 || true
 echo "y" | ufw enable >/dev/null 2>&1 || true
 
